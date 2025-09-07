@@ -7,9 +7,8 @@
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
-    # Direct variable access - these will be loaded from group_vars/all.yml automatically
-    # dynatrace_url: "{{ dynatrace_url }}"
-    # dynatrace_token: "{{ dynatrace_token }}"
+    dynatrace_url: "https://ofp39563.live.dynatrace.com"
+    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
   
   tasks:
     - name: Set timestamps
@@ -33,9 +32,8 @@
             host: "{{ inventory_hostname }}"
             phase: "precheck"
             timestamp: "{{ current_iso }}"
+        status_code: [200, 201, 202]
       delegate_to: localhost
-      run_once: false
-      become: false
       vars:
         ansible_connection: local
       
@@ -83,9 +81,8 @@
           esxi.patch.precheck.build_number,host={{ inventory_hostname }} {{ host_current_build }} {{ precheck_timestamp }}
           esxi.patch.precheck.datastore_space_gb,host={{ inventory_hostname }} {{ host_available_space }} {{ precheck_timestamp }}
           esxi.patch.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }} {{ precheck_timestamp }}
+        status_code: [200, 201, 202, 204]
       delegate_to: localhost
-      run_once: false
-      become: false
       vars:
         ansible_connection: local
       
@@ -107,9 +104,8 @@
             current_build: "{{ host_current_build }}"
             available_space_gb: "{{ host_available_space }}"
             ssh_status: "{{ host_ssh_status }}"
+        status_code: [200, 201, 202]
       delegate_to: localhost
-      run_once: false
-      become: false
       vars:
         ansible_connection: local
       
