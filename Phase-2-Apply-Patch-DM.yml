@@ -7,12 +7,12 @@
     ansible_user: root
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     target_build: "24859861"
     grace_period: 120
     max_wait_time: 900
-    # Direct variable access - these will be loaded from group_vars/all.yml automatically
-    dynatrace_url: "{{ dynatrace_url }}"
-    dynatrace_token: "{{ dynatrace_token }}"
+    dynatrace_url: "https://ofp39563.live.dynatrace.com"
+    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
     
   tasks:
     - name: Set timestamps
@@ -39,8 +39,10 @@
           properties:
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
-      connection: local
+        status_code: [200, 201, 202]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
         
     - name: Get pre-reboot build
       raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
@@ -69,8 +71,10 @@
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
             action: "reboot_initiated"
-      connection: local
+        status_code: [200, 201, 202]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Initiate reboot
       raw: reboot
@@ -83,8 +87,9 @@
         port: 22
         state: stopped
         timeout: 120
-      connection: local
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Grace period
       pause:
@@ -97,8 +102,9 @@
         state: started
         delay: 30
         timeout: "{{ max_wait_time }}"
-      connection: local
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       register: host_recovery
       
     - name: Calculate downtime
@@ -133,8 +139,10 @@
           esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ now().strftime('%s') }}
           esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ now().strftime('%s') }}
           esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ now().strftime('%s') }}
-      connection: local
+        status_code: [200, 201, 202, 204]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Send Phase 2 completion event to Dynatrace
       uri:
@@ -156,8 +164,10 @@
             target_build: "{{ target_build }}"
             downtime_seconds: "{{ downtime_seconds }}"
             total_duration_seconds: "{{ phase2_duration }}"
-      connection: local
+        status_code: [200, 201, 202]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Display final status
       debug:
