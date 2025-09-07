@@ -13,18 +13,20 @@
     target_build: "24859861"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
-    
+    # Upload timeout in seconds (120 minutes)
+    patch_upload_timeout_seconds: 7200
+
   tasks:
     - name: Set timestamps
       set_fact:
         current_epoch: "{{ now().strftime('%s') }}"
         current_iso: "{{ now().isoformat() }}"
       run_once: true
-      
+
     - name: Record phase 1 start time
       set_fact:
         phase1_start_time: "{{ current_epoch }}"
-        
+
     - name: Send Phase 1 start event to Dynatrace
       uri:
         url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -46,11 +48,11 @@
       delegate_to: localhost
       vars:
         ansible_connection: local
-      
+
     - name: Check if patch needed
       set_fact:
         needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
-        
+
     - name: Send eligibility metric to Dynatrace
       uri:
         url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
@@ -64,36 +66,103 @@
       delegate_to: localhost
       vars:
         ansible_connection: local
-          
+
     - name: Execute staging process
       when: needs_patching
       block:
         - name: Create patches directory
           raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
-          
+
         - name: Check if patch file exists
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
           register: patch_exists
-          
+
         - name: Record upload start time
           set_fact:
             upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
-          
-        - name: Upload patch using synchronize
-          synchronize:
-            src: "{{ patch_source }}/{{ patch_file }}"
-            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-            mode: push
-            rsync_opts:
-              - "--progress"
-              - "--partial"
-              - "--timeout=600"
+
+        - name: Upload patch using scp (controller -> ESXi) with 120 minute timeout
+          delegate_to: localhost
+          vars:
+            dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
+          ansible.builtin.shell: |
+            # enforce wall-clock timeout using the configured variable
+            timeout {{ patch_upload_timeout_seconds }} sshpass -p "{{ ansible_password }}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              "{{ patch_source }}/{{ patch_file }}" \
+              "root@{{ inventory_hostname }}:{{ dest_ds }}/{{ patch_file }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
           register: rsync_result
-          
+          changed_when: rsync_result.rc == 0
+          failed_when: rsync_result.rc != 0
+
+        - name: Send Dynatrace metric if upload timed out (exit code 124)
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - rsync_result is defined
+            - rsync_result.rc == 124
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.upload_timeout,host={{ inventory_hostname }} 1 {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+
+        - name: Send Dynatrace event and metric if upload failed for any other reason
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - rsync_result is defined
+            - rsync_result.rc != 0
+          block:
+            - name: Send upload failure metric
+              uri:
+                url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+                method: POST
+                headers:
+                  Authorization: "Api-Token {{ dynatrace_token }}"
+                  Content-Type: "text/plain; charset=utf-8"
+                body: |
+                  esxi.patch.phase1.upload_success,host={{ inventory_hostname }} 0 {{ now().strftime('%s') }}
+                status_code: [200, 201, 202, 204]
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+
+            - name: Send upload failure event with reason to Dynatrace
+              uri:
+                url: "{{ dynatrace_url }}/api/v2/events/ingest"
+                method: POST
+                headers:
+                  Authorization: "Api-Token {{ dynatrace_token }}"
+                  Content-Type: "application/json"
+                body_format: json
+                body:
+                  eventType: "CUSTOM_ALERT"
+                  title: "ESXi Phase 1 Upload Failed"
+                  properties:
+                    host: "{{ inventory_hostname }}"
+                    phase: "phase1_staging"
+                    patch_file: "{{ patch_file }}"
+                    rc: "{{ rsync_result.rc }}"
+                    stderr: "{{ rsync_result.stderr | default('') }}"
+                    stdout: "{{ rsync_result.stdout | default('') }}"
+                    severity: "ERROR"
+                status_code: [200, 201, 202]
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+
         - name: Calculate upload duration and send to Dynatrace
-          when: "'NOT_FOUND' in patch_exists.stdout"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - rsync_result is defined
+            - rsync_result.rc == 0
           block:
             - set_fact:
                 upload_duration: "{{ (now().strftime('%s') | int) - (upload_start | int) }}"
@@ -109,7 +178,7 @@
               delegate_to: localhost
               vars:
                 ansible_connection: local
-            
+
         - name: Perform dry-run
           raw: |
             esxcli software profile update \
@@ -117,7 +186,7 @@
               -p {{ patch_profile }} \
               --dry-run
           register: dry_run_result
-          
+
         - name: Send dry-run status to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
@@ -131,7 +200,7 @@
           delegate_to: localhost
           vars:
             ansible_connection: local
-            
+
         - name: Stage patch with no-live-install
           raw: |
             esxcli software profile update \
@@ -139,13 +208,13 @@
               -p {{ patch_profile }} \
               --no-live-install
           register: staging_result
-          
+
         - name: Validate staging success
           set_fact:
             staging_success: "{{ 'The update completed successfully' in staging_result.stdout }}"
             reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
             phase1_duration: "{{ (now().strftime('%s') | int) - (phase1_start_time | int) }}"
-            
+
         - name: Send Phase 1 completion metrics to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
@@ -161,7 +230,7 @@
           delegate_to: localhost
           vars:
             ansible_connection: local
-          
+
         - name: Send Phase 1 completion event to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -184,7 +253,7 @@
           delegate_to: localhost
           vars:
             ansible_connection: local
-            
+
     - name: Send skip notification if patch not needed
       uri:
         url: "{{ dynatrace_url }}/api/v2/events/ingest"
