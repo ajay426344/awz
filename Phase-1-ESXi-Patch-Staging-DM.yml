@@ -91,118 +91,130 @@
           delegate_to: localhost
           vars:
             ansible_connection: local
-          shell: |
-            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{{ inventory_hostname }} 'echo SSH_OK'
+          shell: >
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+            root@{{ inventory_hostname }} 'echo SSH_OK'
           register: conn_check
           failed_when: conn_check.rc != 0
           changed_when: false
           when: "'NOT_FOUND' in patch_exists.stdout"
 
-        - name: Split source file into parts on controller (only when missing)
+        - name: Create temporary split directory on controller
           delegate_to: localhost
           vars:
+            ansible_connection: local
+          shell: mktemp -d /tmp/patchsplit.XXXXXX
+          register: tmpdir
+          changed_when: true
+          when: "'NOT_FOUND' in patch_exists.stdout"
+
+        - name: Split source file into parts on controller
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
             src_file: "{{ patch_source }}/{{ patch_file }}"
+            tmpdir_path: "{{ tmpdir.stdout }}"
           shell: |
             set -euo pipefail
-            TMPDIR="$(mktemp -d /tmp/patchsplit.XXXXXX)"
-            echo "${TMPDIR}"
-            # Prefer split -n if available (roughly equal pieces)
+            # prefer 'split -n' if available for roughly-equal parts
             if split --version >/dev/null 2>&1; then
-              split -n r/{{ parallel_splits }} -d --additional-suffix=.part "{{ src_file }}" "${TMPDIR}/{{ patch_file }}.part."
+              split -n r/{{ parallel_splits }} -d --additional-suffix=.part "{{ src_file }}" "{{ tmpdir_path }}/{{ patch_file }}.part."
             else
               FILESIZE=$(stat -c%s "{{ src_file }}")
               PARTSIZE=$(( (FILESIZE + {{ parallel_splits }} - 1) / {{ parallel_splits }} ))
-              split -b ${PARTSIZE} -d --additional-suffix=.part "{{ src_file }}" "${TMPDIR}/{{ patch_file }}.part."
+              split -b ${PARTSIZE} -d --additional-suffix=.part "{{ src_file }}" "{{ tmpdir_path }}/{{ patch_file }}.part."
             fi
-            # output tmpdir and list of parts
-            echo "TMPDIR=${TMPDIR}"
-            ls -1 "${TMPDIR}"/*.part.* || true
-          register: split_out
+            echo "SPLIT_DONE"
+          register: split_cmd
           changed_when: true
           when: "'NOT_FOUND' in patch_exists.stdout"
           args:
             executable: /bin/bash
 
-        - name: Set split_tmpdir and parts list facts
-          set_fact:
-            split_tmpdir: "{{ (split_out.stdout_lines[0] | default('')) if (split_out.stdout_lines is defined) else '' }}"
-            split_parts: "{{ (split_out.stdout_lines[1:] | default([])) if (split_out.stdout_lines is defined) else [] }}"
+        - name: List parts created (controller)
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            tmpdir_path: "{{ tmpdir.stdout }}"
+          shell: ls -1 "{{ tmpdir_path }}"/*.part.* || true
+          register: parts_ls
+          changed_when: false
           when: "'NOT_FOUND' in patch_exists.stdout"
 
-        - name: Fallback - if split_parts empty, try extracting lines from split_out stdout
+        - name: Set split_parts and split_tmpdir facts
           set_fact:
-            split_parts: "{{ split_out.stdout | regex_findall('(/tmp/patchsplit\\.[^\\s]+/[^\\s]+\\.part\\.[0-9]+)') }}"
-          when:
-            - "'NOT_FOUND' in patch_exists.stdout"
-            - (split_parts | length) == 0
+            split_tmpdir: "{{ tmpdir.stdout | default('') }}"
+            split_parts: "{{ parts_ls.stdout_lines | default([]) }}"
+          when: "'NOT_FOUND' in patch_exists.stdout"
 
         - name: Launch parallel scp jobs (one async job per part)
           delegate_to: localhost
           vars:
-            dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
-            dest_dir: "{{ dest_ds }}"
+            dest_dir: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
             scp_opts: "{{ scp_extra_opts }}"
+            ansible_connection: local
           async: "{{ patch_upload_timeout_seconds }}"
           poll: 0
           loop: "{{ split_parts }}"
           loop_control:
             label: "{{ item | basename }}"
           shell: >
-            scp {{ scp_opts }} "{{ item }}" "root@{{ inventory_hostname }}:{{ dest_dir }}/{{ patch_file }}.$(basename {{ item }})"
+            scp {{ scp_opts }} "{{ item }}" "root@{{ inventory_hostname }}:{{ dest_dir }}/{{ patch_file }}.{{ item | basename }}"
           register: scp_jobs
-          when: "'NOT_FOUND' in patch_exists.stdout"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - split_parts | length > 0
           args:
             executable: /bin/bash
 
-        - name: Wait for each scp async job to finish (polling)
+        - name: Gather job ids for uploads
+          set_fact:
+            scp_job_ids: "{{ scp_jobs.results | map(attribute='ansible_job_id') | list }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - scp_jobs is defined
+
+        - name: Poll each scp async job until finished
           delegate_to: localhost
           vars:
             wait_delay: 5
             wait_retries: "{{ (patch_upload_timeout_seconds // wait_delay) | int }}"
-          block:
-            - name: Build list of job ids
-              set_fact:
-                job_list: "{{ scp_jobs.results | map(attribute='ansible_job_id') | list }}"
-              when: scp_jobs is defined
+            ansible_connection: local
+          async_status:
+            jid: "{{ item }}"
+          register: job_status_results
+          until: job_status_results.finished
+          retries: "{{ wait_retries }}"
+          delay: "{{ wait_delay }}"
+          loop: "{{ scp_job_ids | default([]) }}"
+          loop_control:
+            label: "{{ item }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - scp_job_ids is defined
+          args:
+            executable: /bin/bash
 
-            - name: Poll each async job until finished
-              async_status:
-                jid: "{{ item }}"
-              register: job_status
-              until: job_status.finished
-              retries: "{{ wait_retries }}"
-              delay: "{{ wait_delay }}"
-              loop: "{{ job_list | default([]) }}"
-              loop_control:
-                label: "{{ item }}"
-              when: job_list is defined
-          when: "'NOT_FOUND' in patch_exists.stdout"
-
-        - name: Collect job statuses and determine upload rc
+        - name: Build upload_failed_jobs list
           set_fact:
             upload_failed_jobs: >-
               {{
-                (
-                  job_status.results | default([])
-                  | selectattr('ansible_facts.ansible_job_id','defined')
-                  | map(attribute='ansible_facts')
-                  | selectattr('rc','defined')
-                  | selectattr('rc','ne',0)
-                  | list
-                )
+                job_status_results.results
+                | default([])
+                | selectattr('ansible_facts.rc','defined')
+                | selectattr('ansible_facts.rc','ne',0)
+                | list
               }}
-          when:
-            - "'NOT_FOUND' in patch_exists.stdout"
-            - job_status is defined
+          when: "'NOT_FOUND' in patch_exists.stdout"
 
         - name: Concatenate parts on ESXi and cleanup remote parts (only if no failed upload jobs)
           delegate_to: localhost
           vars:
-            dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
+            dest_dir: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
+            ansible_connection: local
           shell: |
             set -euo pipefail
-            # remote concat and cleanup
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{{ inventory_hostname }} bash -lc $'cat "{{ dest_ds }}/{{ patch_file }}.part."* > "{{ dest_ds }}/{{ patch_file }}" && rm -f "{{ dest_ds }}/{{ patch_file }}.part."*'
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{{ inventory_hostname }} bash -lc $'cat "{{ dest_dir }}/{{ patch_file }}.part."* > "{{ dest_dir }}/{{ patch_file }}" && rm -f "{{ dest_dir }}/{{ patch_file }}.part."*'
           register: concat_result
           changed_when: concat_result.rc == 0
           failed_when: concat_result.rc != 0
@@ -226,8 +238,8 @@
           set_fact:
             rsync_result:
               rc: 2
-              stdout: "{{ (job_status.results | map(attribute='stdout') | join('\\n')) | default('') }}"
-              stderr: "{{ (job_status.results | map(attribute='stderr') | join('\\n')) | default('') }}"
+              stdout: "{{ (job_status_results.results | map(attribute='stdout') | join('\n')) | default('') }}"
+              stderr: "{{ (job_status_results.results | map(attribute='stderr') | join('\n')) | default('') }}"
           when:
             - "'NOT_FOUND' in patch_exists.stdout"
             - upload_failed_jobs is defined
@@ -245,6 +257,15 @@
             - (upload_failed_jobs | length) == 0
             - concat_result is defined
             - concat_result.rc != 0
+
+        - name: Cleanup local split tmpdir
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          file:
+            path: "{{ split_tmpdir | default('') }}"
+            state: absent
+          when: split_tmpdir is defined and split_tmpdir != ''
 
         - name: Send Dynatrace metric if upload timed out (detected by rc 124)
           when:
