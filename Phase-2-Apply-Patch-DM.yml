@@ -11,8 +11,8 @@
     grace_period: 120
     max_wait_time: 900
     # Direct variable access - these will be loaded from group_vars/all.yml automatically
-    # dynatrace_url: "{{ dynatrace_url }}"
-    # dynatrace_token: "{{ dynatrace_token }}"
+    dynatrace_url: "{{ dynatrace_url }}"
+    dynatrace_token: "{{ dynatrace_token }}"
     
   tasks:
     - name: Set timestamps
