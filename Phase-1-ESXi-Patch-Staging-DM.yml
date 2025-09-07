@@ -41,6 +41,7 @@
             phase: "phase1_staging"
             patch_file: "{{ patch_file }}"
             target_build: "{{ target_build }}"
+            severity: "INFO"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
@@ -170,7 +171,7 @@
               Content-Type: "application/json"
             body_format: json
             body:
-              eventType: "{{ 'CUSTOM_INFO' if staging_success else 'ERROR' }}"
+              eventType: "CUSTOM_INFO"
               title: "ESXi Phase 1 {{ 'Completed' if staging_success else 'Failed' }}"
               properties:
                 host: "{{ inventory_hostname }}"
@@ -178,7 +179,32 @@
                 status: "{{ 'success' if staging_success else 'failed' }}"
                 duration_seconds: "{{ phase1_duration }}"
                 reboot_required: "{{ reboot_required }}"
+                severity: "{{ 'INFO' if staging_success else 'ERROR' }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
           vars:
             ansible_connection: local
+            
+    - name: Send skip notification if patch not needed
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Skipped - Already Updated"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase1_staging"
+            status: "skipped"
+            current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
+            target_build: "{{ target_build }}"
+            severity: "INFO"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+      when: not needs_patching
