@@ -1,0 +1,29 @@
+---
+- name: Simple ESXi Pre-check (Raw Commands Only)
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    
+  tasks:
+    - name: Get ESXi version with raw
+      raw: vmware -v
+      register: version_output
+      
+    - name: Get build number with raw
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: build_number
+      
+    - name: Get datastore info with raw
+      raw: df -h | grep datastore
+      register: datastore_info
+      
+    - name: Display collected information
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Version: {{ version_output.stdout | trim }}"
+          - "Build: {{ build_number.stdout | trim }}"
+          - "Datastores: {{ datastore_info.stdout_lines }}"
