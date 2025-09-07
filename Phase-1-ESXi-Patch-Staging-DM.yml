@@ -1,5 +1,5 @@
 ---
-- name: Phase 1 - ESXi Patch Staging (Core Functionality Only)
+- name: Phase 1 - ESXi Patch Staging with Dynatrace Monitoring
   hosts: all
   gather_facts: no
   vars:
@@ -11,44 +11,113 @@
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     patch_source: "/mnt/patches"
     target_build: "24859861"
-
+    dynatrace_url: "https://ofp39563.live.dynatrace.com"
+    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+    
   tasks:
     - name: Set timestamps
       set_fact:
         current_epoch: "{{ now().strftime('%s') }}"
-        phase1_start_time: "{{ now().strftime('%s') }}"
-
+        current_iso: "{{ now().isoformat() }}"
+      run_once: true
+      
+    - name: Record phase 1 start time
+      set_fact:
+        phase1_start_time: "{{ current_epoch }}"
+        
+    - name: Send Phase 1 start event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Staging Started"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase1_staging"
+            patch_file: "{{ patch_file }}"
+            target_build: "{{ target_build }}"
+        status_code: [200, 201, 202]
+      
     - name: Check if patch needed
       set_fact:
         needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
-
-    - name: Display patching status
-      debug:
-        msg: "Host {{ inventory_hostname }} needs patching: {{ needs_patching }}"
-
+        
+    - name: Send eligibility metric to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
+        status_code: [200, 201, 202, 204]
+          
     - name: Execute staging process
       when: needs_patching
       block:
         - name: Create patches directory
           raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
-
+          
         - name: Check if patch file exists
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
           register: patch_exists
-
-        - name: Upload patch file to ESXi host
-          copy:
-            src: "{{ patch_file }}"
-            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-            mode: '0644'
+          
+        - name: Record upload start time
+          set_fact:
+            upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
-          register: upload_result
-
-        - name: Display upload status
+          
+        - name: Upload patch file using SCP
+          raw: |
+            # Download from controller to ESXi host using wget/curl
+            wget -O {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              http://{{ ansible_control_host | default('controller') }}/patches/{{ patch_file }} 2>/dev/null || \
+            curl -o {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              http://{{ ansible_control_host | default('controller') }}/patches/{{ patch_file }} 2>/dev/null || \
+            echo "DOWNLOAD_FAILED"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          register: download_result
+          
+        - name: Alternative - Manual copy instruction
           debug:
-            msg: "Upload {{ 'successful' if upload_result is succeeded else 'failed' }}"
-          when: "'NOT_FOUND' in patch_exists.stdout"
-
+            msg: 
+              - "Upload the patch file manually using:"
+              - "scp {{ patch_source }}/{{ patch_file }} root@{{ inventory_hostname }}:{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/"
+              - "Then re-run this playbook"
+          when: 
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - "'DOWNLOAD_FAILED' in download_result.stdout"
+          
+        - name: Fail if file upload needed but not available
+          fail:
+            msg: "Patch file must be uploaded manually. See debug message above."
+          when: 
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - "'DOWNLOAD_FAILED' in download_result.stdout"
+          
+        - name: Calculate upload duration and send to Dynatrace
+          when: 
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - "'DOWNLOAD_FAILED' not in download_result.stdout"
+          block:
+            - set_fact:
+                upload_duration: "{{ (now().strftime('%s') | int) - (upload_start | int) }}"
+            - uri:
+                url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+                method: POST
+                headers:
+                  Authorization: "Api-Token {{ dynatrace_token }}"
+                  Content-Type: "text/plain; charset=utf-8"
+                body: |
+                  esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ now().strftime('%s') }}
+                status_code: [200, 201, 202, 204]
+            
         - name: Perform dry-run
           raw: |
             esxcli software profile update \
@@ -56,13 +125,18 @@
               -p {{ patch_profile }} \
               --dry-run
           register: dry_run_result
-
-        - name: Display dry-run results
-          debug:
-            msg: 
-              - "Dry-run {{ 'passed' if dry_run_result.rc == 0 else 'failed' }}"
-              - "Return code: {{ dry_run_result.rc }}"
-
+          
+        - name: Send dry-run status to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+            
         - name: Stage patch with no-live-install
           raw: |
             esxcli software profile update \
@@ -70,24 +144,61 @@
               -p {{ patch_profile }} \
               --no-live-install
           register: staging_result
-
+          
         - name: Validate staging success
           set_fact:
             staging_success: "{{ 'The update completed successfully' in staging_result.stdout }}"
             reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
             phase1_duration: "{{ (now().strftime('%s') | int) - (phase1_start_time | int) }}"
-
-        - name: Display staging results
-          debug:
-            msg:
-              - "========================================="
-              - "Host: {{ inventory_hostname }}"
-              - "Staging: {{ 'SUCCESS' if staging_success else 'FAILED' }}"
-              - "Reboot Required: {{ reboot_required }}"
-              - "Duration: {{ phase1_duration }} seconds"
-              - "========================================="
-
-    - name: Display skip message if patch not needed
-      debug:
-        msg: "Host {{ inventory_hostname }} already has target build {{ target_build }} or newer"
+            
+        - name: Send Phase 1 completion metrics to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          
+        - name: Send Phase 1 completion event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "ESXi Phase 1 {{ 'Completed' if staging_success else 'Failed' }}"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase1_staging"
+                status: "{{ 'success' if staging_success else 'failed' }}"
+                duration_seconds: "{{ phase1_duration }}"
+                reboot_required: "{{ reboot_required }}"
+            status_code: [200, 201, 202]
+            
+    - name: Send skip notification if patch not needed
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Skipped - Already Updated"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase1_staging"
+            status: "skipped"
+            current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
+            target_build: "{{ target_build }}"
+        status_code: [200, 201, 202]
       when: not needs_patching
