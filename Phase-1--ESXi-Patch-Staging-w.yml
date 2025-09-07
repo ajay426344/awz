@@ -33,17 +33,36 @@
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
           register: patch_exists
           
-        - name: Upload patch file if needed
+        - name: Upload patch using synchronize (rsync)
+          synchronize:
+            src: "{{ patch_source }}/{{ patch_file }}"
+            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+            mode: push
+            rsync_opts:
+              - "--progress"
+              - "--partial"
+              - "--timeout=600"
+              - "--bwlimit=0"  # No bandwidth limit
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          register: rsync_result
+          
+        - name: Fallback to copy module if rsync fails
           copy:
             src: "{{ patch_source }}/{{ patch_file }}"
             dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-          when: "'NOT_FOUND' in patch_exists.stdout"
+          when: 
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - rsync_result is failed
           async: 3600
           poll: 60
           
         - name: Verify patch file
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
           register: patch_verify
+          
+        - name: Display patch file info
+          debug:
+            msg: "Patch file: {{ patch_verify.stdout }}"
           
         - name: List available profiles
           raw: |
@@ -96,6 +115,12 @@
               "{{ inventory_hostname }}_phase1": "{{ 'success' if staging_success else 'failed' }}"
               "{{ inventory_hostname }}_ready_for_reboot": "{{ 'true' if reboot_required else 'false' }}"
               
+        - name: Clean up patch file after successful staging (optional)
+          raw: rm -f {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
+          when: 
+            - staging_success
+            - auto_cleanup | default(false)
+            
         - name: Fail if staging unsuccessful
           fail:
             msg: "Phase 1 staging failed for {{ inventory_hostname }}"
