@@ -1,0 +1,102 @@
+---
+- name: Phase 1 - ESXi Patch Staging
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    patch_profile: "ESXi-8.0U3g-24859861-standard"
+    patch_source: "/mnt/patches"
+    target_build: "24859861"
+    
+  tasks:
+    - name: Check if patch needed
+      set_fact:
+        needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
+        
+    - name: Display patching decision
+      debug:
+        msg: >
+          Host {{ inventory_hostname }}: 
+          Current build {{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }} 
+          {% if needs_patching %}-> NEEDS PATCHING to {{ target_build }}{% else %}-> Already up-to-date{% endif %}
+          
+    - name: Execute staging process
+      when: needs_patching
+      block:
+        - name: Create patches directory
+          raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
+          
+        - name: Check if patch file exists on ESXi
+          raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
+          register: patch_exists
+          
+        - name: Upload patch file if needed
+          copy:
+            src: "{{ patch_source }}/{{ patch_file }}"
+            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          async: 3600
+          poll: 60
+          
+        - name: Verify patch file
+          raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
+          register: patch_verify
+          
+        - name: List available profiles
+          raw: |
+            esxcli software sources profile list -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} | head -20
+          register: profile_list
+          
+        - name: Display available profiles
+          debug:
+            var: profile_list.stdout_lines
+            
+        - name: Perform dry-run first
+          raw: |
+            esxcli software profile update \
+              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
+              --dry-run
+          register: dry_run_result
+          
+        - name: Display dry-run results
+          debug:
+            msg: "Dry-run output:"
+            var: dry_run_result.stdout_lines
+            
+        - name: Stage patch with no-live-install
+          raw: |
+            esxcli software profile update \
+              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
+              --no-live-install
+          register: staging_result
+          
+        - name: Validate staging success
+          set_fact:
+            staging_success: "{{ 'The update completed successfully' in staging_result.stdout }}"
+            reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
+            
+        - name: Display staging status
+          debug:
+            msg:
+              - "========================================="
+              - "Host: {{ inventory_hostname }}"
+              - "Staging Status: {{ 'SUCCESS' if staging_success else 'FAILED' }}"
+              - "Reboot Required: {{ 'YES' if reboot_required else 'NO' }}"
+              - "Message: {{ 'Ready for Phase 2 reboot' if staging_success and reboot_required else 'Check logs' }}"
+              - "========================================="
+              
+        - name: Save staging results
+          set_stats:
+            data:
+              "{{ inventory_hostname }}_phase1": "{{ 'success' if staging_success else 'failed' }}"
+              "{{ inventory_hostname }}_ready_for_reboot": "{{ 'true' if reboot_required else 'false' }}"
+              
+        - name: Fail if staging unsuccessful
+          fail:
+            msg: "Phase 1 staging failed for {{ inventory_hostname }}"
+          when: not staging_success
