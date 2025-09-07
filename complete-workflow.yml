@@ -5,7 +5,7 @@
   gather_facts: no
   vars:
     ansible_user: root
-    ansible_password: \"Ajay@426344\"
+    ansible_password: "Ajay@426344"
   
   tasks:
     - name: Run pre-checks
@@ -21,18 +21,18 @@
         
         - name: Extract build number
           set_fact:
-            current_build: \"{{ esxi_version.stdout | regex_search('build-([0-9]+)') | regex_replace('build-', '') }}\"
+            current_build: "{{ esxi_version.stdout | regex_search('build-([0-9]+)') | regex_replace('build-', '') }}"
         
         - name: Check datastores
           shell: |
-            esxcli storage filesystem list | grep VMFS | awk '\$5+0 > 3 {print \$1\":\"\$5}'
+            esxcli storage filesystem list | grep VMFS | awk '$5+0 > 3 {print $1":"$5}'
           register: datastores
         
         - name: Store results
           set_stats:
             data:
-              \"{{ inventory_hostname }}_build\": \"{{ current_build }}\"
-              \"{{ inventory_hostname }}_datastore\": \"{{ datastores.stdout_lines[0] | default('none') }}\"
+              "{{ inventory_hostname }}_build": "{{ current_build }}"
+              "{{ inventory_hostname }}_datastore": "{{ datastores.stdout_lines[0] | default('none') }}"
 
 # Version check
 - name: Version Compatibility Check
@@ -42,12 +42,12 @@
   tasks:
     - name: Set target patch info
       set_fact:
-        target_build: \"24859861\"  # ESXi 8.0U3g
+        target_build: "24859861"  # ESXi 8.0U3g
         
     - name: Display compatibility
       debug:
-        msg: \"Host {{ item }} - Current: {{ hostvars[item][item + '_build'] }} - Target: {{ target_build }}\"
-      with_items: \"{{ groups['all'] }}\"
+        msg: "Host {{ item }} - Current: {{ hostvars[item][item + '_build'] }} - Target: {{ target_build }}"
+      with_items: "{{ groups['all'] }}"
 
 # Phase 1 - Staging
 - name: Phase 1 - Patch Staging
@@ -55,9 +55,9 @@
   gather_facts: no
   vars:
     ansible_user: root
-    ansible_password: \"Ajay@426344\"
-    patch_file: \"VMware-ESXi-8.0U3g-24859861-depot.zip\"
-    patch_profile: \"ESXi-8.0U3g-24859861-standard\"
+    ansible_password: "Ajay@426344"
+    patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    patch_profile: "ESXi-8.0U3g-24859861-standard"
     
   tasks:
     - name: Stage patch only if needed
@@ -68,14 +68,14 @@
         
         - name: Copy patch file
           copy:
-            src: \"/mnt/patches/{{ patch_file }}\"
-            dest: \"/vmfs/volumes/datastore1/patches/{{ patch_file }}\"
+            src: "/mnt/patches/{{ patch_file }}"
+            dest: "/vmfs/volumes/datastore1/patches/{{ patch_file }}"
         
         - name: Stage with no-live-install
           shell: |
-            esxcli software profile update \\
-              -d /vmfs/volumes/datastore1/patches/{{ patch_file }} \\
-              -p {{ patch_profile }} \\
+            esxcli software profile update \
+              -d /vmfs/volumes/datastore1/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
               --no-live-install
           register: staging_result
         
