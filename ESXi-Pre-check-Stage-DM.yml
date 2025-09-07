@@ -7,9 +7,9 @@
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
-    dynatrace_url: "{{ dynatrace_url }}"
-    dynatrace_token: "{{ dynatrace_token }}"
-    
+    dynatrace_url: "https://ofp39563.live.dynatrace.com"
+    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+  
   tasks:
     - name: Set timestamps
       set_fact:
