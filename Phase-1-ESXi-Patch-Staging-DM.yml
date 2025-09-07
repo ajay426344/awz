@@ -11,8 +11,8 @@
     patch_source: "/mnt/patches"
     target_build: "24859861"
     # Direct variable access - these will be loaded from group_vars/all.yml automatically
-    # dynatrace_url: "{{ dynatrace_url }}"
-    # dynatrace_token: "{{ dynatrace_token }}"
+    dynatrace_url: "{{ dynatrace_url }}"
+    dynatrace_token: "{{ dynatrace_token }}"
     
   tasks:
     - name: Set timestamps
