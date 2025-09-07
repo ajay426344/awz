@@ -10,6 +10,7 @@
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     patch_source: "/mnt/patches"
     target_build: "24859861"
+    scp_source_host: "{{ ansible_control_host | default('localhost') }}"
     
   tasks:
     - name: Check if patch needed
@@ -33,30 +34,25 @@
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
           register: patch_exists
           
-        - name: Upload patch using synchronize (rsync)
-          synchronize:
-            src: "{{ patch_source }}/{{ patch_file }}"
-            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-            mode: push
-            rsync_opts:
-              - "--progress"
-              - "--partial"
-              - "--timeout=600"
-              - "--bwlimit=0"  # No bandwidth limit
+        - name: Transfer patch file using SCP
+          raw: |
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                {{ scp_source_host }}:{{ patch_source }}/{{ patch_file }} \
+                {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
           when: "'NOT_FOUND' in patch_exists.stdout"
-          register: rsync_result
-          
-        - name: Fallback to copy module if rsync fails
-          copy:
-            src: "{{ patch_source }}/{{ patch_file }}"
-            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-          when: 
-            - "'NOT_FOUND' in patch_exists.stdout"
-            - rsync_result is failed
+          register: scp_result
           async: 3600
-          poll: 60
+          poll: 30
           
-        - name: Verify patch file
+        - name: Display SCP transfer status
+          debug:
+            msg: 
+              - "SCP Transfer Status: {{ 'SUCCESS' if scp_result.rc == 0 else 'FAILED' }}"
+              - "Transfer output: {{ scp_result.stdout if scp_result.stdout else 'No output' }}"
+              - "Transfer errors: {{ scp_result.stderr if scp_result.stderr else 'No errors' }}"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          
+        - name: Verify patch file after transfer
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
           register: patch_verify
           
@@ -64,6 +60,21 @@
           debug:
             msg: "Patch file: {{ patch_verify.stdout }}"
           
+        - name: Check patch file integrity
+          raw: |
+            FILE_SIZE=$(stat -c%s {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }})
+            if [ "$FILE_SIZE" -gt 0 ]; then
+              echo "File size OK: $FILE_SIZE bytes"
+            else
+              echo "ERROR: File size is 0 or file missing"
+              exit 1
+            fi
+          register: file_integrity
+          
+        - name: Display file integrity check
+          debug:
+            msg: "{{ file_integrity.stdout }}"
+            
         - name: List available profiles
           raw: |
             esxcli software sources profile list -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} | head -20
