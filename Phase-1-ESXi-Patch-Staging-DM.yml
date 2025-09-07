@@ -1,0 +1,159 @@
+---
+- name: Phase 1 - ESXi Patch Staging with Dynatrace Monitoring
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    patch_profile: "ESXi-8.0U3g-24859861-standard"
+    patch_source: "/mnt/patches"
+    target_build: "24859861"
+    dynatrace_url: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_url') }}"
+    dynatrace_token: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_token') }}"
+    
+  tasks:
+    - name: Record phase 1 start time
+      set_fact:
+        phase1_start_time: "{{ ansible_date_time.epoch }}"
+        
+    - name: Send Phase 1 start event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Staging Started"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase1_staging"
+            patch_file: "{{ patch_file }}"
+            target_build: "{{ target_build }}"
+      delegate_to: localhost
+      
+    - name: Check if patch needed
+      set_fact:
+        needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
+        
+    - name: Send eligibility metric to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
+      delegate_to: localhost
+          
+    - name: Execute staging process
+      when: needs_patching
+      block:
+        - name: Create patches directory
+          raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
+          
+        - name: Check if patch file exists
+          raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
+          register: patch_exists
+          
+        - name: Record upload start time
+          set_fact:
+            upload_start: "{{ ansible_date_time.epoch }}"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          
+        - name: Upload patch using synchronize
+          synchronize:
+            src: "{{ patch_source }}/{{ patch_file }}"
+            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+            mode: push
+            rsync_opts:
+              - "--progress"
+              - "--partial"
+              - "--timeout=600"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          register: rsync_result
+          
+        - name: Calculate upload duration and send to Dynatrace
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          block:
+            - set_fact:
+                upload_duration: "{{ (ansible_date_time.epoch | int) - (upload_start | int) }}"
+            - uri:
+                url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+                method: POST
+                headers:
+                  Authorization: "Api-Token {{ dynatrace_token }}"
+                  Content-Type: "text/plain; charset=utf-8"
+                body: |
+                  esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ ansible_date_time.epoch }}
+              delegate_to: localhost
+            
+        - name: Perform dry-run
+          raw: |
+            esxcli software profile update \
+              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
+              --dry-run
+          register: dry_run_result
+          
+        - name: Send dry-run status to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ ansible_date_time.epoch }}
+          delegate_to: localhost
+            
+        - name: Stage patch with no-live-install
+          raw: |
+            esxcli software profile update \
+              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
+              --no-live-install
+          register: staging_result
+          
+        - name: Validate staging success
+          set_fact:
+            staging_success: "{{ 'The update completed successfully' in staging_result.stdout }}"
+            reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
+            phase1_duration: "{{ (ansible_date_time.epoch | int) - (phase1_start_time | int) }}"
+            
+        - name: Send Phase 1 completion metrics to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ ansible_date_time.epoch }}
+              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ ansible_date_time.epoch }}
+              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ ansible_date_time.epoch }}
+          delegate_to: localhost
+          
+        - name: Send Phase 1 completion event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "{{ 'CUSTOM_INFO' if staging_success else 'ERROR' }}"
+              title: "ESXi Phase 1 {{ 'Completed' if staging_success else 'Failed' }}"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase1_staging"
+                status: "{{ 'success' if staging_success else 'failed' }}"
+                duration_seconds: "{{ phase1_duration }}"
+                reboot_required: "{{ reboot_required }}"
+          delegate_to: localhost
