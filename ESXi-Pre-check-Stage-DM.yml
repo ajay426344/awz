@@ -95,7 +95,7 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          eventType: "{{ 'CUSTOM_INFO' if precheck_passed else 'ERROR' }}"
+          eventType: "CUSTOM_INFO"
           title: "ESXi Pre-check {{ 'Passed' if precheck_passed else 'Failed' }}"
           properties:
             host: "{{ inventory_hostname }}"
@@ -104,6 +104,7 @@
             current_build: "{{ host_current_build }}"
             available_space_gb: "{{ host_available_space }}"
             ssh_status: "{{ host_ssh_status }}"
+            severity: "{{ 'INFO' if precheck_passed else 'ERROR' }}"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
