@@ -1,0 +1,156 @@
+---
+- name: Phase 2 - Apply Patch with Dynatrace Monitoring
+  hosts: all
+  gather_facts: no
+  serial: 1
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    target_build: "24859861"
+    grace_period: 120
+    max_wait_time: 900
+    dynatrace_url: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_url') }}"
+    dynatrace_token: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_token') }}"
+    
+  tasks:
+    - name: Record Phase 2 start time
+      set_fact:
+        phase2_start_time: "{{ ansible_date_time.epoch }}"
+        
+    - name: Send Phase 2 start event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 2 Reboot Started"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_reboot"
+      delegate_to: localhost
+        
+    - name: Get pre-reboot build
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: pre_reboot_build
+      
+    - name: Enter maintenance mode
+      raw: esxcli system maintenanceMode set --enable true
+      register: mm_enable
+      
+    - name: Record reboot start time
+      set_fact:
+        reboot_start_time: "{{ ansible_date_time.epoch }}"
+      
+    - name: Send reboot initiated event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Host Rebooting"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_reboot"
+            action: "reboot_initiated"
+      delegate_to: localhost
+      
+    - name: Initiate reboot
+      raw: reboot
+      async: 1
+      poll: 0
+      
+    - name: Wait for host offline
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: stopped
+        timeout: 120
+      delegate_to: localhost
+      
+    - name: Grace period
+      pause:
+        seconds: "{{ grace_period }}"
+        
+    - name: Wait for host online
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: started
+        delay: 30
+        timeout: "{{ max_wait_time }}"
+      delegate_to: localhost
+      register: host_recovery
+      
+    - name: Calculate downtime
+      set_fact:
+        downtime_seconds: "{{ (ansible_date_time.epoch | int) - (reboot_start_time | int) }}"
+        
+    - name: Wait for SSH ready
+      wait_for_connection:
+        timeout: 300
+        
+    - name: Exit maintenance mode
+      raw: esxcli system maintenanceMode set --enable false
+      
+    - name: Get post-reboot build
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: post_reboot_build
+      
+    - name: Verify patch application
+      set_fact:
+        patch_applied: "{{ post_reboot_build.stdout | trim == target_build }}"
+        phase2_duration: "{{ (ansible_date_time.epoch | int) - (phase2_start_time | int) }}"
+        
+    - name: Send Phase 2 completion metrics to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.phase2.success,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ ansible_date_time.epoch }}
+          esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ ansible_date_time.epoch }}
+          esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ ansible_date_time.epoch }}
+          esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ ansible_date_time.epoch }}
+      delegate_to: localhost
+      
+    - name: Send Phase 2 completion event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "{{ 'CUSTOM_INFO' if patch_applied else 'ERROR' }}"
+          title: "ESXi Patching {{ 'Completed Successfully' if patch_applied else 'Failed' }}"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_complete"
+            status: "{{ 'success' if patch_applied else 'failed' }}"
+            pre_build: "{{ pre_reboot_build.stdout | trim }}"
+            post_build: "{{ post_reboot_build.stdout | trim }}"
+            target_build: "{{ target_build }}"
+            downtime_seconds: "{{ downtime_seconds }}"
+            total_duration_seconds: "{{ phase2_duration }}"
+      delegate_to: localhost
+      
+    - name: Display final status
+      debug:
+        msg:
+          - "========================================="
+          - "Patch Status: {{ 'SUCCESS' if patch_applied else 'FAILED' }}"
+          - "New Build: {{ post_reboot_build.stdout | trim }}"
+          - "Downtime: {{ downtime_seconds }} seconds"
+          - "========================================="
