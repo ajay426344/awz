@@ -1,0 +1,119 @@
+---
+- name: Phase 2 - Apply Patch and Reboot
+  hosts: all
+  gather_facts: no
+  serial: 1  # Process one host at a time
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    target_build: "24859861"
+    grace_period: 120
+    max_wait_time: 900
+    
+  tasks:
+    - name: Verify host is ready for Phase 2
+      assert:
+        that:
+          - hostvars[inventory_hostname][inventory_hostname + '_ready_for_reboot'] == 'true'
+        fail_msg: "Host {{ inventory_hostname }} is not ready for Phase 2"
+        success_msg: "Host {{ inventory_hostname }} is ready for reboot"
+        
+    - name: Get pre-reboot information
+      block:
+        - name: Get current build number
+          raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+          register: pre_reboot_build
+          
+        - name: Check running VMs
+          raw: vim-cmd vmsvc/getallvms 2>/dev/null | grep -v "^Id" | wc -l
+          register: vm_count
+          
+        - name: Display pre-reboot status
+          debug:
+            msg:
+              - "Current Build: {{ pre_reboot_build.stdout | trim }}"
+              - "Running VMs: {{ vm_count.stdout | trim }}"
+              
+    - name: Enter maintenance mode
+      raw: esxcli system maintenanceMode set --enable true
+      register: mm_enable
+      
+    - name: Verify maintenance mode
+      raw: esxcli system maintenanceMode get
+      register: mm_status
+      
+    - name: Initiate reboot to apply patch
+      raw: reboot
+      async: 1
+      poll: 0
+      
+    - name: Wait for host to go offline
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: stopped
+        delay: 10
+        timeout: 120
+      delegate_to: localhost
+      
+    - name: Display reboot status
+      debug:
+        msg: "Host is rebooting. Waiting {{ grace_period }} seconds for patch application..."
+        
+    - name: Grace period for patch application
+      pause:
+        seconds: "{{ grace_period }}"
+        
+    - name: Wait for host to come back online
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: started
+        delay: 30
+        timeout: "{{ max_wait_time }}"
+      delegate_to: localhost
+      
+    - name: Wait for SSH to be ready
+      wait_for_connection:
+        delay: 30
+        timeout: 300
+        
+    - name: Exit maintenance mode
+      raw: esxcli system maintenanceMode set --enable false
+      retries: 3
+      delay: 10
+      register: mm_disable
+      
+    - name: Get post-reboot information
+      block:
+        - name: Get new build number
+          raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+          register: post_reboot_build
+          
+        - name: Get full version
+          raw: vmware -v
+          register: new_version
+          
+    - name: Verify patch application
+      set_fact:
+        patch_applied: "{{ post_reboot_build.stdout | trim == target_build }}"
+        
+    - name: Display final status
+      debug:
+        msg:
+          - "========================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Pre-reboot Build: {{ pre_reboot_build.stdout | trim }}"
+          - "Post-reboot Build: {{ post_reboot_build.stdout | trim }}"
+          - "Target Build: {{ target_build }}"
+          - "Patch Status: {{ 'SUCCESS' if patch_applied else 'FAILED' }}"
+          - "New Version: {{ new_version.stdout | trim }}"
+          - "========================================="
+          
+    - name: Final validation
+      assert:
+        that:
+          - patch_applied
+        fail_msg: "Patch was not applied successfully. Current build: {{ post_reboot_build.stdout | trim }}, Expected: {{ target_build }}"
+        success_msg: "Patch successfully applied. Host is now running build {{ target_build }}"
