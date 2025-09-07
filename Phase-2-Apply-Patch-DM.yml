@@ -39,6 +39,7 @@
           properties:
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
+            severity: "INFO"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
@@ -51,6 +52,27 @@
     - name: Enter maintenance mode
       raw: esxcli system maintenanceMode set --enable true
       register: mm_enable
+      
+    - name: Send maintenance mode event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Host Entered Maintenance Mode"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_reboot"
+            action: "maintenance_mode_enabled"
+            severity: "INFO"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Record reboot start time
       set_fact:
@@ -71,6 +93,7 @@
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
             action: "reboot_initiated"
+            severity: "WARNING"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
@@ -107,6 +130,27 @@
         ansible_connection: local
       register: host_recovery
       
+    - name: Send host recovered event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Host Back Online"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_reboot"
+            action: "host_recovered"
+            severity: "INFO"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+      
     - name: Calculate downtime
       set_fact:
         downtime_seconds: "{{ (now().strftime('%s') | int) - (reboot_start_time | int) }}"
@@ -117,6 +161,27 @@
         
     - name: Exit maintenance mode
       raw: esxcli system maintenanceMode set --enable false
+      
+    - name: Send maintenance mode exit event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Host Exited Maintenance Mode"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase2_reboot"
+            action: "maintenance_mode_disabled"
+            severity: "INFO"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Get post-reboot build
       raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
@@ -153,7 +218,7 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          eventType: "{{ 'CUSTOM_INFO' if patch_applied else 'ERROR' }}"
+          eventType: "CUSTOM_INFO"
           title: "ESXi Patching {{ 'Completed Successfully' if patch_applied else 'Failed' }}"
           properties:
             host: "{{ inventory_hostname }}"
@@ -164,6 +229,7 @@
             target_build: "{{ target_build }}"
             downtime_seconds: "{{ downtime_seconds }}"
             total_duration_seconds: "{{ phase2_duration }}"
+            severity: "{{ 'INFO' if patch_applied else 'ERROR' }}"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
