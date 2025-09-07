@@ -1,0 +1,43 @@
+---
+- name: Debug ESXi Connection
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    
+  tasks:
+    - name: Test with raw module (no Python needed)
+      raw: echo "Connection successful"
+      register: raw_test
+      
+    - name: Show raw result
+      debug:
+        var: raw_test.stdout
+        
+    - name: Try hostname with raw
+      raw: hostname
+      register: hostname_raw
+      
+    - name: Show hostname
+      debug:
+        var: hostname_raw.stdout
+        
+    - name: Test vmware command with raw
+      raw: /bin/vmware -v
+      register: vmware_raw
+      ignore_errors: yes
+      
+    - name: Show vmware result
+      debug:
+        var: vmware_raw
+        
+    - name: Check Python availability
+      raw: which python || which python3 || echo "No Python found"
+      register: python_check
+      
+    - name: Show Python status
+      debug:
+        var: python_check.stdout
