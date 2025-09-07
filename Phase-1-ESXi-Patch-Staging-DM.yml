@@ -10,8 +10,9 @@
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     patch_source: "/mnt/patches"
     target_build: "24859861"
-    dynatrace_url: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_url') }}"
-    dynatrace_token: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_token') }}"
+    # Direct variable access - these will be loaded from group_vars/all.yml automatically
+    # dynatrace_url: "{{ dynatrace_url }}"
+    # dynatrace_token: "{{ dynatrace_token }}"
     
   tasks:
     - name: Record phase 1 start time
