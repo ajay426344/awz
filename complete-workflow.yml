@@ -1,40 +1,41 @@
 ---
-# Pre-check playbook
+# Pre-check Phase
 - name: ESXi Pre-check Phase
   hosts: all
   gather_facts: no
   vars:
     ansible_user: root
     ansible_password: "Ajay@426344"
+    ansible_connection: ssh
   
   tasks:
-    - name: Run pre-checks
-      block:
-        - name: Test SSH connectivity
-          wait_for_connection:
-            timeout: 30
-          register: ssh_check
+    - name: Get ESXi version
+      raw: vmware -v
+      register: version_output
+      
+    - name: Extract build number
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: current_build_raw
+      
+    - name: Check datastore space
+      raw: df -h | grep datastore | awk '{if ($4+0 > 3) print $6":"$4}'
+      register: datastore_space
+      
+    - name: Set facts for host
+      set_fact:
+        host_current_build: "{{ current_build_raw.stdout | trim }}"
+        host_datastore: "{{ datastore_space.stdout_lines[0] | default('none') }}"
+        host_version: "{{ version_output.stdout | trim }}"
         
-        - name: Get current build
-          shell: vmware -v
-          register: esxi_version
-        
-        - name: Extract build number
-          set_fact:
-            current_build: "{{ esxi_version.stdout | regex_search('build-([0-9]+)') | regex_replace('build-', '') }}"
-        
-        - name: Check datastores
-          shell: |
-            esxcli storage filesystem list | grep VMFS | awk '$5+0 > 3 {print $1":"$5}'
-          register: datastores
-        
-        - name: Store results
-          set_stats:
-            data:
-              "{{ inventory_hostname }}_build": "{{ current_build }}"
-              "{{ inventory_hostname }}_datastore": "{{ datastores.stdout_lines[0] | default('none') }}"
+    - name: Display host status
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Current Build: {{ host_current_build }}"
+          - "Version: {{ host_version }}"
+          - "Datastore Available: {{ host_datastore }}"
 
-# Version check
+# Version Compatibility Check
 - name: Version Compatibility Check
   hosts: localhost
   gather_facts: no
@@ -42,11 +43,19 @@
   tasks:
     - name: Set target patch info
       set_fact:
-        target_build: "24859861"  # ESXi 8.0U3g
+        target_build: "24859861"  # ESXi 8.0U3g - Latest
+        target_version: "8.0.3"
         
-    - name: Display compatibility
+    - name: Check each host eligibility
       debug:
-        msg: "Host {{ item }} - Current: {{ hostvars[item][item + '_build'] }} - Target: {{ target_build }}"
+        msg: >
+          Host {{ item }}: 
+          Current build {{ hostvars[item]['host_current_build'] }} 
+          {% if hostvars[item]['host_current_build']|int < target_build|int %}
+          -> NEEDS PATCHING to {{ target_build }}
+          {% else %}
+          -> ALREADY UP TO DATE
+          {% endif %}
       with_items: "{{ groups['all'] }}"
 
 # Phase 1 - Staging
@@ -56,29 +65,76 @@
   vars:
     ansible_user: root
     ansible_password: "Ajay@426344"
+    ansible_connection: ssh
     patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
     patch_profile: "ESXi-8.0U3g-24859861-standard"
+    target_build: "24859861"
     
   tasks:
-    - name: Stage patch only if needed
-      when: hostvars[inventory_hostname][inventory_hostname + '_build'] < '24859861'
+    - name: Check if patching needed
+      set_fact:
+        needs_patch: "{{ host_current_build|int < target_build|int }}"
+        
+    - name: Display patch decision
+      debug:
+        msg: >
+          Host {{ inventory_hostname }}: 
+          Current build {{ host_current_build }} < Target {{ target_build }}
+          {% if needs_patch %}-> PROCEEDING WITH PATCHING{% else %}-> Skipping - already up to date{% endif %}
+    
+    - name: Stage patch
+      when: needs_patch
       block:
         - name: Create patch directory
-          shell: mkdir -p /vmfs/volumes/datastore1/patches
-        
-        - name: Copy patch file
+          raw: mkdir -p /vmfs/volumes/datastore1/patches
+          
+        - name: Check if patch exists
+          raw: ls /vmfs/volumes/datastore1/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
+          register: patch_check
+          
+        - name: Display patch file status
+          debug:
+            msg: >
+              Patch file /vmfs/volumes/datastore1/patches/{{ patch_file }}: 
+              {{ 'EXISTS' if 'NOT_FOUND' not in patch_check.stdout else 'NEEDS TO BE UPLOADED' }}
+            
+        - name: Upload patch file (if needed)
           copy:
             src: "/mnt/patches/{{ patch_file }}"
             dest: "/vmfs/volumes/datastore1/patches/{{ patch_file }}"
-        
+          when: "'NOT_FOUND' in patch_check.stdout"
+          
+        - name: List available profiles in patch
+          raw: |
+            esxcli software sources profile list -d /vmfs/volumes/datastore1/patches/{{ patch_file }}
+          register: profile_list
+          
+        - name: Display available profiles
+          debug:
+            var: profile_list.stdout_lines
+            
+        - name: Perform dry-run
+          raw: |
+            esxcli software profile update \
+              -d /vmfs/volumes/datastore1/patches/{{ patch_file }} \
+              -p {{ patch_profile }} \
+              --dry-run
+          register: dry_run_result
+          
+        - name: Display dry-run results
+          debug:
+            msg: "Dry-run output:"
+            var: dry_run_result.stdout_lines
+            
         - name: Stage with no-live-install
-          shell: |
+          raw: |
             esxcli software profile update \
               -d /vmfs/volumes/datastore1/patches/{{ patch_file }} \
               -p {{ patch_profile }} \
               --no-live-install
           register: staging_result
-        
+          
         - name: Display staging result
           debug:
+            msg: "Staging complete:"
             var: staging_result.stdout_lines
