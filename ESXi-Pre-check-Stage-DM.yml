@@ -7,8 +7,9 @@
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
-    dynatrace_url: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_url') }}"
-    dynatrace_token: "{{ lookup('file', 'group_vars/all.yml') | from_yaml | json_query('dynatrace_token') }}"
+    # Direct variable access - these will be loaded from group_vars/all.yml automatically
+    # dynatrace_url: "{{ dynatrace_url }}"
+    # dynatrace_token: "{{ dynatrace_token }}"
   
   tasks:
     - name: Send pre-check start event to Dynatrace
