@@ -135,9 +135,9 @@
               Authorization: "Api-Token {{ dynatrace_token }}"
               Content-Type: "text/plain; charset=utf-8"
             body: |
-              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ ansible_date_time.epoch }}
-              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ ansible_date_time.epoch }}
-              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ ansible_date_time.epoch }}
+              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
           delegate_to: localhost
           
         - name: Send Phase 1 completion event to Dynatrace
