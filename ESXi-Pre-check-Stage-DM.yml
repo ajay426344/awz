@@ -12,6 +12,12 @@
     # dynatrace_token: "{{ dynatrace_token }}"
   
   tasks:
+    - name: Get current timestamp
+      setup:
+        filter: ansible_date_time
+      delegate_to: localhost
+      run_once: true
+      
     - name: Send pre-check start event to Dynatrace
       uri:
         url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -55,7 +61,7 @@
         host_datastores: "{{ datastore_info.stdout_lines }}"
         host_selected_datastore: "{{ datastore_info.stdout_lines[0].split(':')[0] if datastore_info.stdout_lines else '/vmfs/volumes/datastore1' }}"
         host_available_space: "{{ datastore_info.stdout_lines[0].split(':')[1] if datastore_info.stdout_lines else '0' }}"
-        precheck_timestamp: "{{ ansible_date_time.epoch }}"
+        precheck_timestamp: "{{ current_epoch }}"
         
     - name: Determine pre-check status
       set_fact:
