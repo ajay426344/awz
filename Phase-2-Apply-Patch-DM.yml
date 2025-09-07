@@ -15,9 +15,15 @@
     # dynatrace_token: "{{ dynatrace_token }}"
     
   tasks:
+    - name: Set timestamps
+      set_fact:
+        current_epoch: "{{ now().strftime('%s') }}"
+        current_iso: "{{ now().isoformat() }}"
+      run_once: true
+      
     - name: Record Phase 2 start time
       set_fact:
-        phase2_start_time: "{{ ansible_date_time.epoch }}"
+        phase2_start_time: "{{ current_epoch }}"
         
     - name: Send Phase 2 start event to Dynatrace
       uri:
@@ -33,6 +39,7 @@
           properties:
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
+      connection: local
       delegate_to: localhost
         
     - name: Get pre-reboot build
@@ -45,7 +52,7 @@
       
     - name: Record reboot start time
       set_fact:
-        reboot_start_time: "{{ ansible_date_time.epoch }}"
+        reboot_start_time: "{{ now().strftime('%s') }}"
       
     - name: Send reboot initiated event to Dynatrace
       uri:
@@ -62,6 +69,7 @@
             host: "{{ inventory_hostname }}"
             phase: "phase2_reboot"
             action: "reboot_initiated"
+      connection: local
       delegate_to: localhost
       
     - name: Initiate reboot
@@ -75,6 +83,7 @@
         port: 22
         state: stopped
         timeout: 120
+      connection: local
       delegate_to: localhost
       
     - name: Grace period
@@ -88,12 +97,13 @@
         state: started
         delay: 30
         timeout: "{{ max_wait_time }}"
+      connection: local
       delegate_to: localhost
       register: host_recovery
       
     - name: Calculate downtime
       set_fact:
-        downtime_seconds: "{{ (ansible_date_time.epoch | int) - (reboot_start_time | int) }}"
+        downtime_seconds: "{{ (now().strftime('%s') | int) - (reboot_start_time | int) }}"
         
     - name: Wait for SSH ready
       wait_for_connection:
@@ -109,7 +119,7 @@
     - name: Verify patch application
       set_fact:
         patch_applied: "{{ post_reboot_build.stdout | trim == target_build }}"
-        phase2_duration: "{{ (ansible_date_time.epoch | int) - (phase2_start_time | int) }}"
+        phase2_duration: "{{ (now().strftime('%s') | int) - (phase2_start_time | int) }}"
         
     - name: Send Phase 2 completion metrics to Dynatrace
       uri:
@@ -123,6 +133,7 @@
           esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ now().strftime('%s') }}
           esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ now().strftime('%s') }}
           esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ now().strftime('%s') }}
+      connection: local
       delegate_to: localhost
       
     - name: Send Phase 2 completion event to Dynatrace
@@ -145,6 +156,7 @@
             target_build: "{{ target_build }}"
             downtime_seconds: "{{ downtime_seconds }}"
             total_duration_seconds: "{{ phase2_duration }}"
+      connection: local
       delegate_to: localhost
       
     - name: Display final status
