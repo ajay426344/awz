@@ -13,8 +13,6 @@
     target_build: "24859861"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
-    # Upload timeout in seconds (120 minutes)
-    patch_upload_timeout_seconds: 7200
 
   tasks:
     - name: Set timestamps
@@ -43,11 +41,9 @@
             phase: "phase1_staging"
             patch_file: "{{ patch_file }}"
             target_build: "{{ target_build }}"
-            severity: "INFO"
         status_code: [200, 201, 202]
+      connection: local
       delegate_to: localhost
-      vars:
-        ansible_connection: local
 
     - name: Check if patch needed
       set_fact:
@@ -63,9 +59,8 @@
         body: |
           esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
         status_code: [200, 201, 202, 204]
+      connection: local
       delegate_to: localhost
-      vars:
-        ansible_connection: local
 
     - name: Execute staging process
       when: needs_patching
@@ -82,87 +77,18 @@
             upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
 
-        - name: Upload patch using scp (controller -> ESXi) with 120 minute timeout
-          delegate_to: localhost
-          connection: local
-          shell: |
-            timeout {{ patch_upload_timeout_seconds }} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              "{{ patch_source }}/{{ patch_file }}" \
-              "root@{{ inventory_hostname }}:{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+        - name: Upload patch file to ESXi host
+          copy:
+            src: "{{ patch_source }}/{{ patch_file }}"
+            dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+            mode: '0644'
           when: "'NOT_FOUND' in patch_exists.stdout"
-          register: rsync_result
-          changed_when: rsync_result.rc == 0
-          failed_when: rsync_result.rc != 0
-          args:
-            executable: /bin/bash
-
-        - name: Send Dynatrace metric if upload timed out (exit code 124)
-          when:
-            - "'NOT_FOUND' in patch_exists.stdout"
-            - rsync_result is defined
-            - rsync_result.rc == 124
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "text/plain; charset=utf-8"
-            body: |
-              esxi.patch.phase1.upload_timeout,host={{ inventory_hostname }} 1 {{ now().strftime('%s') }}
-            status_code: [200, 201, 202, 204]
-          delegate_to: localhost
-          vars:
-            ansible_connection: local
-
-        - name: Send Dynatrace event and metric if upload failed for any other reason
-          when:
-            - "'NOT_FOUND' in patch_exists.stdout"
-            - rsync_result is defined
-            - rsync_result.rc != 0
-          block:
-            - name: Send upload failure metric
-              uri:
-                url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-                method: POST
-                headers:
-                  Authorization: "Api-Token {{ dynatrace_token }}"
-                  Content-Type: "text/plain; charset=utf-8"
-                body: |
-                  esxi.patch.phase1.upload_success,host={{ inventory_hostname }} 0 {{ now().strftime('%s') }}
-                status_code: [200, 201, 202, 204]
-              delegate_to: localhost
-              vars:
-                ansible_connection: local
-
-            - name: Send upload failure event with reason to Dynatrace
-              uri:
-                url: "{{ dynatrace_url }}/api/v2/events/ingest"
-                method: POST
-                headers:
-                  Authorization: "Api-Token {{ dynatrace_token }}"
-                  Content-Type: "application/json"
-                body_format: json
-                body:
-                  eventType: "CUSTOM_ALERT"
-                  title: "ESXi Phase 1 Upload Failed"
-                  properties:
-                    host: "{{ inventory_hostname }}"
-                    phase: "phase1_staging"
-                    patch_file: "{{ patch_file }}"
-                    rc: "{{ rsync_result.rc }}"
-                    stderr: "{{ rsync_result.stderr | default('') }}"
-                    stdout: "{{ rsync_result.stdout | default('') }}"
-                    severity: "ERROR"
-                status_code: [200, 201, 202]
-              delegate_to: localhost
-              vars:
-                ansible_connection: local
+          register: upload_result
 
         - name: Calculate upload duration and send to Dynatrace
-          when:
+          when: 
             - "'NOT_FOUND' in patch_exists.stdout"
-            - rsync_result is defined
-            - rsync_result.rc == 0
+            - upload_result is succeeded
           block:
             - set_fact:
                 upload_duration: "{{ (now().strftime('%s') | int) - (upload_start | int) }}"
@@ -175,9 +101,31 @@
                 body: |
                   esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ now().strftime('%s') }}
                 status_code: [200, 201, 202, 204]
+              connection: local
               delegate_to: localhost
-              vars:
-                ansible_connection: local
+
+        - name: Send upload failure event if copy failed
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - upload_result is failed
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "ERROR"
+              title: "ESXi Phase 1 Upload Failed"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase1_staging"
+                patch_file: "{{ patch_file }}"
+                error_msg: "{{ upload_result.msg | default('Upload failed') }}"
+            status_code: [200, 201, 202]
+          connection: local
+          delegate_to: localhost
 
         - name: Perform dry-run
           raw: |
@@ -197,9 +145,8 @@
             body: |
               esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
             status_code: [200, 201, 202, 204]
+          connection: local
           delegate_to: localhost
-          vars:
-            ansible_connection: local
 
         - name: Stage patch with no-live-install
           raw: |
@@ -227,9 +174,8 @@
               esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
               esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
             status_code: [200, 201, 202, 204]
+          connection: local
           delegate_to: localhost
-          vars:
-            ansible_connection: local
 
         - name: Send Phase 1 completion event to Dynatrace
           uri:
@@ -248,11 +194,9 @@
                 status: "{{ 'success' if staging_success else 'failed' }}"
                 duration_seconds: "{{ phase1_duration }}"
                 reboot_required: "{{ reboot_required }}"
-                severity: "{{ 'INFO' if staging_success else 'ERROR' }}"
             status_code: [200, 201, 202]
+          connection: local
           delegate_to: localhost
-          vars:
-            ansible_connection: local
 
     - name: Send skip notification if patch not needed
       uri:
@@ -271,9 +215,7 @@
             status: "skipped"
             current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
             target_build: "{{ target_build }}"
-            severity: "INFO"
         status_code: [200, 201, 202]
+      connection: local
       delegate_to: localhost
-      vars:
-        ansible_connection: local
       when: not needs_patching
