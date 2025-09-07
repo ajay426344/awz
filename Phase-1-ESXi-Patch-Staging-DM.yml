@@ -17,6 +17,20 @@
     patch_upload_timeout_seconds: 7200
 
   tasks:
+    - name: Ensure controller has required CLI tools (scp, ssh)
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+      block:
+        - name: Check scp exists on controller
+          command: which scp
+          register: scp_check
+          failed_when: scp_check.rc != 0
+        - name: Check ssh exists on controller
+          command: which ssh
+          register: ssh_check
+          failed_when: ssh_check.rc != 0
+
     - name: Set timestamps
       set_fact:
         current_epoch: "{{ now().strftime('%s') }}"
@@ -82,13 +96,16 @@
             upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
 
-        - name: Upload patch using scp (controller -> ESXi) with 120 minute timeout
+        - name: Upload patch using scp (controller -> ESXi) with 120 minute timeout (run locally)
           delegate_to: localhost
           vars:
             dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
-          ansible.builtin.shell: |
-            # enforce wall-clock timeout using the configured variable
-            timeout {{ patch_upload_timeout_seconds }} sshpass -p "{{ ansible_password }}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          vars:
+            ansible_connection: local
+          raw: |
+            # run on the controller (local) so it does not attempt SSH to localhost
+            # using plain scp (no sshpass) — controller must authenticate to ESXi via key/agent
+            timeout {{ patch_upload_timeout_seconds }} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               "{{ patch_source }}/{{ patch_file }}" \
               "root@{{ inventory_hostname }}:{{ dest_ds }}/{{ patch_file }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
