@@ -216,6 +216,4 @@
             current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
             target_build: "{{ target_build }}"
         status_code: [200, 201, 202]
-      connection: local
-      delegate_to: localhost
       when: not needs_patching
