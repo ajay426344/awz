@@ -119,10 +119,10 @@
           Authorization: "Api-Token {{ dynatrace_token }}"
           Content-Type: "text/plain; charset=utf-8"
         body: |
-          esxi.patch.phase2.success,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ ansible_date_time.epoch }}
-          esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ ansible_date_time.epoch }}
-          esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ ansible_date_time.epoch }}
-          esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ ansible_date_time.epoch }}
+          esxi.patch.phase2.success,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ now().strftime('%s') }}
+          esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ now().strftime('%s') }}
+          esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ now().strftime('%s') }}
+          esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ now().strftime('%s') }}
       delegate_to: localhost
       
     - name: Send Phase 2 completion event to Dynatrace
