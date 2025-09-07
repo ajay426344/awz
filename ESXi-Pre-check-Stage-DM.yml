@@ -12,10 +12,10 @@
     # dynatrace_token: "{{ dynatrace_token }}"
   
   tasks:
-    - name: Get current timestamp
-      setup:
-        filter: ansible_date_time
-      delegate_to: localhost
+    - name: Set timestamps
+      set_fact:
+        current_epoch: "{{ now().strftime('%s') }}"
+        current_iso: "{{ now().isoformat() }}"
       run_once: true
       
     - name: Send pre-check start event to Dynatrace
@@ -32,7 +32,8 @@
           properties:
             host: "{{ inventory_hostname }}"
             phase: "precheck"
-            timestamp: "{{ ansible_date_time.iso8601 }}"
+            timestamp: "{{ current_iso }}"
+      connection: local
       delegate_to: localhost
       
     - name: Test SSH connectivity
@@ -79,6 +80,7 @@
           esxi.patch.precheck.build_number,host={{ inventory_hostname }} {{ host_current_build }} {{ precheck_timestamp }}
           esxi.patch.precheck.datastore_space_gb,host={{ inventory_hostname }} {{ host_available_space }} {{ precheck_timestamp }}
           esxi.patch.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }} {{ precheck_timestamp }}
+      connection: local
       delegate_to: localhost
       
     - name: Send pre-check completion event to Dynatrace
@@ -99,6 +101,7 @@
             current_build: "{{ host_current_build }}"
             available_space_gb: "{{ host_available_space }}"
             ssh_status: "{{ host_ssh_status }}"
+      connection: local
       delegate_to: localhost
       
     - name: Display pre-check results
