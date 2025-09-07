@@ -1,0 +1,25 @@
+---
+- name: Test ESXi Connection
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: \"Ajay@426344\"
+    
+  tasks:
+    - name: Test basic connection
+      ping:
+    
+    - name: Get hostname
+      raw: hostname
+      register: hostname
+    
+    - name: Get version
+      raw: vmware -v
+      register: version
+    
+    - name: Display results
+      debug:
+        msg:
+          - \"Hostname: {{ hostname.stdout }}\"
+          - \"Version: {{ version.stdout }}\"
