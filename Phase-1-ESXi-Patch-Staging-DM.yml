@@ -15,22 +15,12 @@
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
     # Upload timeout in seconds (120 minutes)
     patch_upload_timeout_seconds: 7200
+    # Tuning for parallel upload: number of parts to split into for parallel scp
+    parallel_splits: 4
+    # scp extra options (no compression, use a light cipher). Adjust if your environment disallows cipher change.
+    scp_extra_opts: "-o Compression=no -o Ciphers=aes128-ctr -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
   tasks:
-    - name: Ensure controller has required CLI tools (scp, ssh)
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      block:
-        - name: Check scp exists on controller
-          command: which scp
-          register: scp_check
-          failed_when: scp_check.rc != 0
-        - name: Check ssh exists on controller
-          command: which ssh
-          register: ssh_check
-          failed_when: ssh_check.rc != 0
-
     - name: Set timestamps
       set_fact:
         current_epoch: "{{ now().strftime('%s') }}"
@@ -84,7 +74,8 @@
     - name: Execute staging process
       when: needs_patching
       block:
-        - name: Create patches directory
+
+        - name: Create patches directory on ESXi
           raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
 
         - name: Check if patch file exists
@@ -96,24 +87,166 @@
             upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
 
-        - name: Upload patch using scp (controller -> ESXi) with 120 minute timeout (run locally)
+        - name: Connectivity smoke-check: controller -> ESXi (BatchMode, no password prompt)
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          shell: |
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{{ inventory_hostname }} 'echo SSH_OK'
+          register: conn_check
+          failed_when: conn_check.rc != 0
+          changed_when: false
+          when: "'NOT_FOUND' in patch_exists.stdout"
+
+        - name: Split source file into parts on controller (only when missing)
+          delegate_to: localhost
+          vars:
+            src_file: "{{ patch_source }}/{{ patch_file }}"
+          shell: |
+            set -euo pipefail
+            TMPDIR="$(mktemp -d /tmp/patchsplit.XXXXXX)"
+            echo "${TMPDIR}"
+            # Prefer split -n if available (roughly equal pieces)
+            if split --version >/dev/null 2>&1; then
+              split -n r/{{ parallel_splits }} -d --additional-suffix=.part "{{ src_file }}" "${TMPDIR}/{{ patch_file }}.part."
+            else
+              FILESIZE=$(stat -c%s "{{ src_file }}")
+              PARTSIZE=$(( (FILESIZE + {{ parallel_splits }} - 1) / {{ parallel_splits }} ))
+              split -b ${PARTSIZE} -d --additional-suffix=.part "{{ src_file }}" "${TMPDIR}/{{ patch_file }}.part."
+            fi
+            # output tmpdir and list of parts
+            echo "TMPDIR=${TMPDIR}"
+            ls -1 "${TMPDIR}"/*.part.* || true
+          register: split_out
+          changed_when: true
+          when: "'NOT_FOUND' in patch_exists.stdout"
+          args:
+            executable: /bin/bash
+
+        - name: Set split_tmpdir and parts list facts
+          set_fact:
+            split_tmpdir: "{{ (split_out.stdout_lines[0] | default('')) if (split_out.stdout_lines is defined) else '' }}"
+            split_parts: "{{ (split_out.stdout_lines[1:] | default([])) if (split_out.stdout_lines is defined) else [] }}"
+          when: "'NOT_FOUND' in patch_exists.stdout"
+
+        - name: Fallback - if split_parts empty, try extracting lines from split_out stdout
+          set_fact:
+            split_parts: "{{ split_out.stdout | regex_findall('(/tmp/patchsplit\\.[^\\s]+/[^\\s]+\\.part\\.[0-9]+)') }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - (split_parts | length) == 0
+
+        - name: Launch parallel scp jobs (one async job per part)
           delegate_to: localhost
           vars:
             dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
-          vars:
-            ansible_connection: local
-          raw: |
-            # run on the controller (local) so it does not attempt SSH to localhost
-            # using plain scp (no sshpass) — controller must authenticate to ESXi via key/agent
-            timeout {{ patch_upload_timeout_seconds }} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              "{{ patch_source }}/{{ patch_file }}" \
-              "root@{{ inventory_hostname }}:{{ dest_ds }}/{{ patch_file }}"
+            dest_dir: "{{ dest_ds }}"
+            scp_opts: "{{ scp_extra_opts }}"
+          async: "{{ patch_upload_timeout_seconds }}"
+          poll: 0
+          loop: "{{ split_parts }}"
+          loop_control:
+            label: "{{ item | basename }}"
+          shell: >
+            scp {{ scp_opts }} "{{ item }}" "root@{{ inventory_hostname }}:{{ dest_dir }}/{{ patch_file }}.$(basename {{ item }})"
+          register: scp_jobs
           when: "'NOT_FOUND' in patch_exists.stdout"
-          register: rsync_result
-          changed_when: rsync_result.rc == 0
-          failed_when: rsync_result.rc != 0
+          args:
+            executable: /bin/bash
 
-        - name: Send Dynatrace metric if upload timed out (exit code 124)
+        - name: Wait for each scp async job to finish (polling)
+          delegate_to: localhost
+          vars:
+            wait_delay: 5
+            wait_retries: "{{ (patch_upload_timeout_seconds // wait_delay) | int }}"
+          block:
+            - name: Build list of job ids
+              set_fact:
+                job_list: "{{ scp_jobs.results | map(attribute='ansible_job_id') | list }}"
+              when: scp_jobs is defined
+
+            - name: Poll each async job until finished
+              async_status:
+                jid: "{{ item }}"
+              register: job_status
+              until: job_status.finished
+              retries: "{{ wait_retries }}"
+              delay: "{{ wait_delay }}"
+              loop: "{{ job_list | default([]) }}"
+              loop_control:
+                label: "{{ item }}"
+              when: job_list is defined
+          when: "'NOT_FOUND' in patch_exists.stdout"
+
+        - name: Collect job statuses and determine upload rc
+          set_fact:
+            upload_failed_jobs: >-
+              {{
+                (
+                  job_status.results | default([])
+                  | selectattr('ansible_facts.ansible_job_id','defined')
+                  | map(attribute='ansible_facts')
+                  | selectattr('rc','defined')
+                  | selectattr('rc','ne',0)
+                  | list
+                )
+              }}
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - job_status is defined
+
+        - name: Concatenate parts on ESXi and cleanup remote parts (only if no failed upload jobs)
+          delegate_to: localhost
+          vars:
+            dest_ds: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches"
+          shell: |
+            set -euo pipefail
+            # remote concat and cleanup
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{{ inventory_hostname }} bash -lc $'cat "{{ dest_ds }}/{{ patch_file }}.part."* > "{{ dest_ds }}/{{ patch_file }}" && rm -f "{{ dest_ds }}/{{ patch_file }}.part."*'
+          register: concat_result
+          changed_when: concat_result.rc == 0
+          failed_when: concat_result.rc != 0
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - upload_failed_jobs is defined
+            - (upload_failed_jobs | length) == 0
+
+        - name: Set rsync_result fact on success (rc 0)
+          set_fact:
+            rsync_result:
+              rc: 0
+              stdout: "{{ concat_result.stdout | default('') }}"
+              stderr: "{{ concat_result.stderr | default('') }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - concat_result is defined
+            - concat_result.rc == 0
+
+        - name: Set rsync_result fact on upload failure (one or more failed jobs)
+          set_fact:
+            rsync_result:
+              rc: 2
+              stdout: "{{ (job_status.results | map(attribute='stdout') | join('\\n')) | default('') }}"
+              stderr: "{{ (job_status.results | map(attribute='stderr') | join('\\n')) | default('') }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - upload_failed_jobs is defined
+            - (upload_failed_jobs | length) > 0
+
+        - name: If concat failed but uploads looked ok, set rsync_result from concat
+          set_fact:
+            rsync_result:
+              rc: "{{ concat_result.rc | default(1) }}"
+              stdout: "{{ concat_result.stdout | default('') }}"
+              stderr: "{{ concat_result.stderr | default('') }}"
+          when:
+            - "'NOT_FOUND' in patch_exists.stdout"
+            - upload_failed_jobs is defined
+            - (upload_failed_jobs | length) == 0
+            - concat_result is defined
+            - concat_result.rc != 0
+
+        - name: Send Dynatrace metric if upload timed out (detected by rc 124)
           when:
             - "'NOT_FOUND' in patch_exists.stdout"
             - rsync_result is defined
