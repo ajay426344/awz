@@ -15,9 +15,15 @@
     # dynatrace_token: "{{ dynatrace_token }}"
     
   tasks:
+    - name: Set timestamps
+      set_fact:
+        current_epoch: "{{ now().strftime('%s') }}"
+        current_iso: "{{ now().isoformat() }}"
+      run_once: true
+      
     - name: Record phase 1 start time
       set_fact:
-        phase1_start_time: "{{ ansible_date_time.epoch }}"
+        phase1_start_time: "{{ current_epoch }}"
         
     - name: Send Phase 1 start event to Dynatrace
       uri:
@@ -35,6 +41,7 @@
             phase: "phase1_staging"
             patch_file: "{{ patch_file }}"
             target_build: "{{ target_build }}"
+      connection: local
       delegate_to: localhost
       
     - name: Check if patch needed
@@ -50,6 +57,7 @@
           Content-Type: "text/plain; charset=utf-8"
         body: |
           esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
+      connection: local
       delegate_to: localhost
           
     - name: Execute staging process
@@ -64,7 +72,7 @@
           
         - name: Record upload start time
           set_fact:
-            upload_start: "{{ ansible_date_time.epoch }}"
+            upload_start: "{{ now().strftime('%s') }}"
           when: "'NOT_FOUND' in patch_exists.stdout"
           
         - name: Upload patch using synchronize
@@ -83,7 +91,7 @@
           when: "'NOT_FOUND' in patch_exists.stdout"
           block:
             - set_fact:
-                upload_duration: "{{ (ansible_date_time.epoch | int) - (upload_start | int) }}"
+                upload_duration: "{{ (now().strftime('%s') | int) - (upload_start | int) }}"
             - uri:
                 url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
                 method: POST
@@ -91,7 +99,8 @@
                   Authorization: "Api-Token {{ dynatrace_token }}"
                   Content-Type: "text/plain; charset=utf-8"
                 body: |
-                  esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ ansible_date_time.epoch }}
+                  esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ now().strftime('%s') }}
+              connection: local
               delegate_to: localhost
             
         - name: Perform dry-run
@@ -110,7 +119,8 @@
               Authorization: "Api-Token {{ dynatrace_token }}"
               Content-Type: "text/plain; charset=utf-8"
             body: |
-              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ ansible_date_time.epoch }}
+              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
+          connection: local
           delegate_to: localhost
             
         - name: Stage patch with no-live-install
@@ -125,7 +135,7 @@
           set_fact:
             staging_success: "{{ 'The update completed successfully' in staging_result.stdout }}"
             reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
-            phase1_duration: "{{ (ansible_date_time.epoch | int) - (phase1_start_time | int) }}"
+            phase1_duration: "{{ (now().strftime('%s') | int) - (phase1_start_time | int) }}"
             
         - name: Send Phase 1 completion metrics to Dynatrace
           uri:
@@ -138,6 +148,7 @@
               esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
               esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
               esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
+          connection: local
           delegate_to: localhost
           
         - name: Send Phase 1 completion event to Dynatrace
@@ -157,4 +168,5 @@
                 status: "{{ 'success' if staging_success else 'failed' }}"
                 duration_seconds: "{{ phase1_duration }}"
                 reboot_required: "{{ reboot_required }}"
+          connection: local
           delegate_to: localhost
