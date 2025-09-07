@@ -33,8 +33,11 @@
             host: "{{ inventory_hostname }}"
             phase: "precheck"
             timestamp: "{{ current_iso }}"
-      connection: local
       delegate_to: localhost
+      run_once: false
+      become: false
+      vars:
+        ansible_connection: local
       
     - name: Test SSH connectivity
       wait_for_connection:
@@ -80,8 +83,11 @@
           esxi.patch.precheck.build_number,host={{ inventory_hostname }} {{ host_current_build }} {{ precheck_timestamp }}
           esxi.patch.precheck.datastore_space_gb,host={{ inventory_hostname }} {{ host_available_space }} {{ precheck_timestamp }}
           esxi.patch.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }} {{ precheck_timestamp }}
-      connection: local
       delegate_to: localhost
+      run_once: false
+      become: false
+      vars:
+        ansible_connection: local
       
     - name: Send pre-check completion event to Dynatrace
       uri:
@@ -101,8 +107,11 @@
             current_build: "{{ host_current_build }}"
             available_space_gb: "{{ host_available_space }}"
             ssh_status: "{{ host_ssh_status }}"
-      connection: local
       delegate_to: localhost
+      run_once: false
+      become: false
+      vars:
+        ansible_connection: local
       
     - name: Display pre-check results
       debug:
