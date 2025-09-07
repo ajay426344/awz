@@ -6,13 +6,13 @@
     ansible_user: root
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     patch_source: "/mnt/patches"
     target_build: "24859861"
-    # Direct variable access - these will be loaded from group_vars/all.yml automatically
-    dynatrace_url: "{{ dynatrace_url }}"
-    dynatrace_token: "{{ dynatrace_token }}"
+    dynatrace_url: "https://ofp39563.live.dynatrace.com"
+    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
     
   tasks:
     - name: Set timestamps
@@ -41,8 +41,10 @@
             phase: "phase1_staging"
             patch_file: "{{ patch_file }}"
             target_build: "{{ target_build }}"
-      connection: local
+        status_code: [200, 201, 202]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
       
     - name: Check if patch needed
       set_fact:
@@ -57,8 +59,10 @@
           Content-Type: "text/plain; charset=utf-8"
         body: |
           esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
-      connection: local
+        status_code: [200, 201, 202, 204]
       delegate_to: localhost
+      vars:
+        ansible_connection: local
           
     - name: Execute staging process
       when: needs_patching
@@ -100,8 +104,10 @@
                   Content-Type: "text/plain; charset=utf-8"
                 body: |
                   esxi.patch.phase1.upload_duration_seconds,host={{ inventory_hostname }} {{ upload_duration }} {{ now().strftime('%s') }}
-              connection: local
+                status_code: [200, 201, 202, 204]
               delegate_to: localhost
+              vars:
+                ansible_connection: local
             
         - name: Perform dry-run
           raw: |
@@ -120,8 +126,10 @@
               Content-Type: "text/plain; charset=utf-8"
             body: |
               esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
-          connection: local
+            status_code: [200, 201, 202, 204]
           delegate_to: localhost
+          vars:
+            ansible_connection: local
             
         - name: Stage patch with no-live-install
           raw: |
@@ -148,8 +156,10 @@
               esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
               esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
               esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
-          connection: local
+            status_code: [200, 201, 202, 204]
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           
         - name: Send Phase 1 completion event to Dynatrace
           uri:
@@ -168,5 +178,7 @@
                 status: "{{ 'success' if staging_success else 'failed' }}"
                 duration_seconds: "{{ phase1_duration }}"
                 reboot_required: "{{ reboot_required }}"
-          connection: local
+            status_code: [200, 201, 202]
           delegate_to: localhost
+          vars:
+            ansible_connection: local
