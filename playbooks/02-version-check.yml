@@ -1,0 +1,81 @@
+# playbooks/02-version-check.yml
+- name: Version Compatibility Check
+  hosts: localhost
+  gather_facts: no
+  
+  tasks:
+    - name: Get selected patch version from database
+      esxi_patch_db:
+        action: get_patch_info
+        patch_file: "{{ selected_patch }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+      register: patch_info
+    
+    - name: Get pre-checked hosts from database
+      esxi_patch_db:
+        action: get_eligible_hosts
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+      register: eligible_hosts
+    
+    - name: Extract patch version from filename
+      set_fact:
+        patch_version: >-
+          {{
+            selected_patch |
+            regex_search('(\d+\.\d+)U(\d+)([a-z])?') |
+            regex_replace('(\d+\.\d+)U(\d+)([a-z])?', '\1.\2.\3') |
+            regex_replace('\.$', '')
+          }}
+    
+    - name: Compare versions for each host
+      set_fact:
+        host_eligibility: >-
+          {%- set result = {} -%}
+          {%- for host in eligible_hosts.hosts -%}
+            {%- set current = host.current_build | regex_replace('[^0-9.]', '') -%}
+            {%- if current is version(patch_version, '<') -%}
+              {%- set _ = result.update({host.hostname: 'phase1_eligible'}) -%}
+            {%- elif current is version(patch_version, '>=') -%}
+              {%- set _ = result.update({host.hostname: 'already_patched'}) -%}
+            {%- else -%}
+              {%- set _ = result.update({host.hostname: 'version_error'}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+    
+    - name: Update database with eligibility
+      esxi_patch_db:
+        action: update_eligibility
+        eligibility_data: "{{ host_eligibility }}"
+        selected_patch: "{{ selected_patch }}"
+        selected_profile: "{{ selected_profile }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+    
+    - name: Set eligible hosts for Phase 1
+      set_stats:
+        data:
+          phase1_hosts: >-
+            {{
+              host_eligibility |
+              dict2items |
+              selectattr('value', 'equalto', 'phase1_eligible') |
+              map(attribute='key') |
+              list
+            }}
+          already_patched_hosts: >-
+            {{
+              host_eligibility |
+              dict2items |
+              selectattr('value', 'equalto', 'already_patched') |
+              map(attribute='key') |
+              list
+            }}

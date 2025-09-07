@@ -1,0 +1,58 @@
+# survey_config.json
+{
+  "name": "ESXi Patch Selection Survey",
+  "description": "Dynamic patch and profile selection",
+  "spec": [
+    {
+      "question_name": "Select Patch File",
+      "question_description": "Choose the patch file to apply",
+      "required": true,
+      "type": "multiplechoice",
+      "variable": "selected_patch",
+      "choices": [
+        "VMware-ESXi-8.0U3g-24859861-depot.zip",
+        "VMware-ESXi-8.0U2-22380479-depot.zip"
+      ],
+      "default": "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    },
+    {
+      "question_name": "Profile Selection",
+      "question_description": "Leave blank to auto-select standard profile",
+      "required": false,
+      "type": "text",
+      "variable": "selected_profile",
+      "default": "",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "question_name": "Auto Apply Phase 2",
+      "question_description": "Automatically apply Phase 2 after threshold?",
+      "required": true,
+      "type": "multiplechoice",
+      "variable": "auto_phase2",
+      "choices": ["yes", "no"],
+      "default": "yes"
+    },
+    {
+      "question_name": "Threshold Minutes",
+      "question_description": "Minutes to wait before Phase 2 (1-1440)",
+      "required": true,
+      "type": "integer",
+      "variable": "threshold_minutes",
+      "min": 1,
+      "max": 1440,
+      "default": 10
+    },
+    {
+      "question_name": "Batch Size",
+      "question_description": "Number of hosts to process in parallel for Phase 1",
+      "required": true,
+      "type": "integer",
+      "variable": "batch_size",
+      "min": 1,
+      "max": 20,
+      "default": 5
+    }
+  ]
+}

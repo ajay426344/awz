@@ -1,0 +1,92 @@
+---
+# playbooks/00-patch-upload.yml
+# This playbook uploads patch and discovers profiles dynamically
+- name: Upload Patch and Discover Profiles
+  hosts: localhost
+  gather_facts: no
+  vars:
+    patch_repository: "/mnt/patches"
+    
+  tasks:
+    - name: List available patch files
+      find:
+        paths: "{{ patch_repository }}"
+        patterns: "*.zip"
+      register: patch_files
+      
+    - name: Display available patches
+      debug:
+        msg: "Found patches: {{ patch_files.files | map(attribute='path') | map('basename') | list }}"
+    
+    - name: Select a test ESXi host for profile discovery
+      set_fact:
+        test_host: "{{ groups['esxi_hosts'][0] }}"
+    
+    - name: Upload patch to test host temporarily
+      delegate_to: "{{ test_host }}"
+      copy:
+        src: "{{ selected_patch_file }}"
+        dest: "/tmp/{{ selected_patch_file | basename }}"
+      vars:
+        ansible_user: root
+        ansible_password: "{{ esxi_password }}"
+    
+    - name: Discover profiles from patch
+      delegate_to: "{{ test_host }}"
+      shell: |
+        esxcli software sources profile list -d /tmp/{{ selected_patch_file | basename }} | \
+        grep -v "^Name" | \
+        awk '{print $1}' | \
+        grep -v "\-sg$"
+      register: discovered_profiles
+      vars:
+        ansible_user: root
+        ansible_password: "{{ esxi_password }}"
+    
+    - name: Parse and filter profiles
+      set_fact:
+        available_profiles: >-
+          {{
+            discovered_profiles.stdout_lines |
+            reject('match', '.*-sg$') |
+            list
+          }}
+    
+    - name: Select default profile (standard version)
+      set_fact:
+        default_profile: >-
+          {{
+            available_profiles |
+            select('match', '.*-standard$') |
+            first |
+            default(available_profiles[0])
+          }}
+    
+    - name: Clean up temporary patch from test host
+      delegate_to: "{{ test_host }}"
+      file:
+        path: "/tmp/{{ selected_patch_file | basename }}"
+        state: absent
+      vars:
+        ansible_user: root
+        ansible_password: "{{ esxi_password }}"
+    
+    - name: Store profiles in database
+      esxi_patch_db:
+        action: store_profiles
+        patch_file: "{{ selected_patch_file | basename }}"
+        profiles: "{{ available_profiles }}"
+        default_profile: "{{ default_profile }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+    
+    - name: Return profile information
+      set_stats:
+        data:
+          patch_profiles: "{{ available_profiles }}"
+          default_profile: "{{ default_profile }}"
+          patch_file: "{{ selected_patch_file | basename }}"
+
+---

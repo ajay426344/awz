@@ -1,0 +1,24 @@
+---
+- name: ESXi Health Check
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Test SSH connectivity
+      wait_for_connection:
+        timeout: 30
+    
+    - name: Get ESXi version
+      shell: vmware -v
+      register: esxi_version
+    
+    - name: Display version
+      debug:
+        msg: "ESXi Version: {{ esxi_version.stdout }}"
+    
+    - name: Check disk space
+      shell: df -h
+      register: disk_space
+    
+    - name: Display disk space
+      debug:
+        var: disk_space.stdout_lines

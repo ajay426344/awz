@@ -1,0 +1,114 @@
+# playbooks/04-phase2-apply.yml
+- name: Phase 2 - Apply Patch and Reboot
+  hosts: "{{ phase2_hosts }}"
+  gather_facts: no
+  serial: 1  # One host at a time for safety
+  vars:
+    ansible_user: root
+    ansible_password: "{{ esxi_password }}"
+    grace_period: 120
+    max_wait: 900
+    
+  tasks:
+    - name: Get current build before patch
+      shell: vmware -v | awk '{print $4}'
+      register: pre_patch_build
+    
+    - name: Enter maintenance mode
+      shell: |
+        esxcli system maintenanceMode set --enable true
+      register: maintenance_mode
+      retries: 3
+      delay: 10
+    
+    - name: Apply staged patch (reboot will happen)
+      shell: |
+        esxcli software profile update \
+          -d {{ target_datastore }}/patches/{{ patch_file }} \
+          -p {{ patch_profile }}
+      register: patch_apply
+      async: 60
+      poll: 0
+    
+    - name: Wait for reboot to start
+      pause:
+        seconds: 30
+    
+    - name: Wait for host to go down
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: stopped
+        delay: 10
+        timeout: 120
+      delegate_to: localhost
+    
+    - name: Apply grace period
+      pause:
+        seconds: "{{ grace_period }}"
+    
+    - name: Monitor host recovery with retries
+      block:
+        - name: Wait for host to come back
+          wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            state: started
+            delay: 30
+            timeout: "{{ max_wait }}"
+          delegate_to: localhost
+          register: host_recovery
+          retries: "{{ (max_wait / 30) | int }}"
+          delay: 30
+          until: host_recovery is succeeded
+      rescue:
+        - name: Mark host as failed in database
+          delegate_to: localhost
+          esxi_patch_db:
+            action: update_phase2_status
+            host: "{{ inventory_hostname }}"
+            status: "failed"
+            failure_reason: "Host did not recover after reboot"
+            timestamp: "{{ ansible_date_time.iso8601 }}"
+            db_host: "{{ db_host }}"
+            db_name: "{{ db_name }}"
+            db_user: "{{ db_user }}"
+            db_password: "{{ db_password }}"
+        - fail:
+            msg: "Host {{ inventory_hostname }} did not recover within {{ max_wait }} seconds"
+    
+    - name: Wait for SSH to be ready
+      wait_for_connection:
+        delay: 30
+        timeout: 300
+    
+    - name: Exit maintenance mode
+      shell: |
+        esxcli system maintenanceMode set --enable false
+      register: exit_mm
+      retries: 3
+      delay: 10
+    
+    - name: Verify new build version
+      shell: vmware -v | awk '{print $4}'
+      register: post_patch_build
+    
+    - name: Verify patch was applied
+      assert:
+        that:
+          - post_patch_build.stdout != pre_patch_build.stdout
+        fail_msg: "Build version unchanged. Patch may not have been applied correctly."
+    
+    - name: Update Phase 2 completion in database
+      delegate_to: localhost
+      esxi_patch_db:
+        action: update_phase2_status
+        host: "{{ inventory_hostname }}"
+        status: "completed"
+        pre_build: "{{ pre_patch_build.stdout }}"
+        post_build: "{{ post_patch_build.stdout }}"
+        timestamp: "{{ ansible_date_time.iso8601 }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"

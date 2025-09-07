@@ -1,0 +1,108 @@
+# playbooks/03-phase1-staging.yml
+- name: Phase 1 - Patch Staging
+  hosts: "{{ phase1_hosts }}"
+  gather_facts: no
+  serial: "{{ batch_size | default(5) }}"
+  vars:
+    ansible_user: root
+    ansible_password: "{{ esxi_password }}"
+    
+  tasks:
+    - name: Get host configuration from database
+      delegate_to: localhost
+      esxi_patch_db:
+        action: get_host_config
+        host: "{{ inventory_hostname }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+      register: host_config
+    
+    - name: Set host variables
+      set_fact:
+        target_datastore: "{{ host_config.selected_datastore }}"
+        patch_file: "{{ selected_patch }}"
+        patch_profile: "{{ selected_profile }}"
+    
+    - name: Create patch directory on datastore
+      shell: |
+        mkdir -p {{ target_datastore }}/patches
+      register: create_dir
+    
+    - name: Check if patch already exists
+      stat:
+        path: "{{ target_datastore }}/patches/{{ patch_file }}"
+      register: patch_exists
+    
+    - name: Upload patch to ESXi host
+      copy:
+        src: "{{ patch_repository }}/{{ patch_file }}"
+        dest: "{{ target_datastore }}/patches/{{ patch_file }}"
+      when: not patch_exists.stat.exists
+      register: patch_upload
+    
+    - name: Verify patch integrity
+      shell: |
+        cd {{ target_datastore }}/patches
+        ls -la {{ patch_file }}
+      register: patch_verify
+    
+    - name: Stage patch with --no-live-install
+      shell: |
+        esxcli software profile update \
+          -d {{ target_datastore }}/patches/{{ patch_file }} \
+          -p {{ patch_profile }} \
+          --no-live-install
+      register: staging_result
+      failed_when: staging_result.rc != 0
+    
+    - name: Parse staging output
+      set_fact:
+        staged_vibs: >-
+          {{
+            staging_result.stdout |
+            regex_findall('VIBs Installed: (.+)') |
+            first |
+            default('')
+          }}
+    
+    - name: Clean up patch file after successful staging
+      file:
+        path: "{{ target_datastore }}/patches/{{ patch_file }}"
+        state: absent
+      when: 
+        - staging_result.rc == 0
+        - auto_cleanup | default(true)
+    
+    - name: Update Phase 1 status in database
+      delegate_to: localhost
+      esxi_patch_db:
+        action: update_phase1_status
+        host: "{{ inventory_hostname }}"
+        status: "{{ 'completed' if staging_result.rc == 0 else 'failed' }}"
+        staged_vibs: "{{ staged_vibs }}"
+        timestamp: "{{ ansible_date_time.iso8601 }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+    
+    - name: Send Phase 1 metrics to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Staging {{ 'Completed' if staging_result.rc == 0 else 'Failed' }}"
+          properties:
+            host: "{{ inventory_hostname }}"
+            patch: "{{ patch_file }}"
+            profile: "{{ patch_profile }}"
+            status: "{{ 'success' if staging_result.rc == 0 else 'failed' }}"
+      delegate_to: localhost
+      when: dynatrace_token is defined

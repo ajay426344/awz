@@ -1,0 +1,29 @@
+---
+- name: Test Database Connection
+  hosts: localhost
+  gather_facts: no
+  vars:
+    db_host: "awx-postgres-15.awx.svc.cluster.local"
+    db_name: "awx"
+    db_user: "awx"
+    db_password: "TAyWg09SKEydouNcec4umVqXVxqChCLW"
+    
+  tasks:
+    - name: Test storing precheck data
+      esxi_patch_db:
+        action: store_precheck
+        host: "test-host-01"
+        ssh_status: "pass"
+        current_build: "21493926"
+        version_details: "8.0.2,21493926"
+        selected_datastore: "/vmfs/volumes/datastore1"
+        available_space_gb: 50.5
+        timestamp: "{{ ansible_date_time.iso8601 }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+      register: result
+      
+    - debug:
+        var: result

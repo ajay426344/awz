@@ -1,0 +1,27 @@
+# group_vars/all.yml - Complete variables file
+---
+# Database configuration
+# Database configuration - use existing AWX database
+db_host: "awx-postgres-15.awx.svc.cluster.local"
+db_name: awx  # Use existing awx database
+db_schema: patch_tracking  # Our schema within awx database
+db_user: awx
+db_password: "{{ lookup('k8s', api_version='v1', kind='Secret', namespace='awx', resource_name='awx-postgres-configuration') | json_query('data.password') | b64decode }}"
+# ESXi credentials
+esxi_password: "Ajay@426344"
+
+# Patch repository
+patch_repository: "/mnt/patches"
+
+# Dynatrace configuration
+dynatrace_url: "https://ofp39563.apps.dynatrace.com"
+dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+
+# Configurable thresholds
+default_threshold_minutes: 10
+grace_period_seconds: 120
+max_wait_seconds: 900
+retry_count: 3
+
+# Auto cleanup setting
+auto_cleanup: true

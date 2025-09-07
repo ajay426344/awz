@@ -1,0 +1,86 @@
+# playbooks/01-precheck.yml
+- name: ESXi Pre-check
+  hosts: "{{ target_hosts | default('esxi_hosts') }}"
+  gather_facts: no
+  serial: 5
+  vars:
+    ansible_user: root
+    ansible_password: "{{ esxi_password }}"
+    
+  tasks:
+    - name: Test SSH connectivity
+      wait_for_connection:
+        timeout: 30
+      register: ssh_check
+    
+    - name: Get current ESXi build version
+      shell: |
+        vmware -v | awk '{print $4}'
+      register: current_build
+      changed_when: false
+    
+    - name: Get ESXi version details
+      shell: |
+        esxcli system version get | grep -E "Version:|Build:" | awk '{print $2}' | paste -sd","
+      register: version_details
+      changed_when: false
+    
+    - name: Check available datastores with space
+      shell: |
+        esxcli storage filesystem list | \
+        grep -E "VMFS|NFS" | \
+        awk '$5 ~ /[0-9]+\.[0-9]+/ && $5+0 > 3 {print $1":"$5}'
+      register: available_datastores
+      changed_when: false
+    
+    - name: Select best datastore (most free space)
+      set_fact:
+        selected_datastore: >-
+          {{
+            available_datastores.stdout_lines |
+            map('split', ':') |
+            sort(attribute='1', reverse=True) |
+            first |
+            first
+          }}
+      when: available_datastores.stdout_lines | length > 0
+    
+    - name: Store pre-check results in database
+      delegate_to: localhost
+      esxi_patch_db:
+        action: store_precheck
+        host: "{{ inventory_hostname }}"
+        ssh_status: "{{ 'pass' if ssh_check.elapsed < 30 else 'fail' }}"
+        current_build: "{{ current_build.stdout }}"
+        version_details: "{{ version_details.stdout }}"
+        selected_datastore: "{{ selected_datastore | default('none') }}"
+        available_space_gb: "{{ available_datastores.stdout_lines[0].split(':')[1] | default(0) }}"
+        timestamp: "{{ ansible_date_time.iso8601 }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+      register: db_result
+    
+    - name: Set host eligibility status
+      set_fact:
+        precheck_passed: >-
+          {{
+            ssh_check.elapsed < 30 and
+            (available_datastores.stdout_lines | length > 0) and
+            selected_datastore is defined
+          }}
+    
+    - name: Send precheck metrics to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.precheck.ssh_connectivity,host={{ inventory_hostname }} {{ 1 if ssh_check.elapsed < 30 else 0 }}
+          esxi.patch.precheck.datastore_count,host={{ inventory_hostname }} {{ available_datastores.stdout_lines | length }}
+          esxi.patch.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }}
+      delegate_to: localhost
+      when: dynatrace_token is defined

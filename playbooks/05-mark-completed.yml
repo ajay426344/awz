@@ -1,0 +1,34 @@
+# playbooks/05-mark-completed.yml
+- name: Mark Already Patched Hosts as Completed
+  hosts: "{{ already_patched_hosts }}"
+  gather_facts: no
+  
+  tasks:
+    - name: Update status to completed
+      delegate_to: localhost
+      esxi_patch_db:
+        action: mark_completed
+        host: "{{ inventory_hostname }}"
+        reason: "Already at or above target patch version"
+        timestamp: "{{ ansible_date_time.iso8601 }}"
+        db_host: "{{ db_host }}"
+        db_name: "{{ db_name }}"
+        db_user: "{{ db_user }}"
+        db_password: "{{ db_password }}"
+    
+    - name: Log to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Host Already Patched"
+          properties:
+            host: "{{ inventory_hostname }}"
+            message: "Host already at target version, marked as completed"
+      delegate_to: localhost
+      when: dynatrace_token is defined
