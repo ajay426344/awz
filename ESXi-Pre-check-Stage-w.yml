@@ -1,0 +1,65 @@
+---
+- name: ESXi Pre-check Stage
+  hosts: all
+  gather_facts: no
+  vars:
+    ansible_user: root
+    ansible_password: "Ajay@426344"
+    ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+  
+  tasks:
+    - name: Test SSH connectivity
+      wait_for_connection:
+        timeout: 30
+      register: ssh_check
+      
+    - name: Get ESXi version information
+      raw: vmware -v
+      register: version_output
+      
+    - name: Extract build number
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: current_build_raw
+      
+    - name: Check available datastores with free space
+      raw: |
+        esxcli storage filesystem list | grep -E "VMFS|NFS" | awk '$5+0 > 3 {print $1":"$5":"$6}'
+      register: datastore_info
+      
+    - name: Get datastore usage details
+      raw: df -h | grep datastore
+      register: df_output
+      
+    - name: Set host facts
+      set_fact:
+        host_ssh_status: "{{ 'PASS' if ssh_check.elapsed < 30 else 'FAIL' }}"
+        host_current_build: "{{ current_build_raw.stdout | trim }}"
+        host_version: "{{ version_output.stdout | trim }}"
+        host_datastores: "{{ datastore_info.stdout_lines }}"
+        host_selected_datastore: "{{ datastore_info.stdout_lines[0].split(':')[0] if datastore_info.stdout_lines else '/vmfs/volumes/datastore1' }}"
+        host_available_space: "{{ datastore_info.stdout_lines[0].split(':')[1] if datastore_info.stdout_lines else '0' }}"
+        
+    - name: Determine pre-check status
+      set_fact:
+        precheck_passed: "{{ host_ssh_status == 'PASS' and host_available_space|float > 3 }}"
+        
+    - name: Display pre-check results
+      debug:
+        msg:
+          - "========================================="
+          - "Host: {{ inventory_hostname }}"
+          - "SSH Status: {{ host_ssh_status }}"
+          - "Current Version: {{ host_version }}"
+          - "Current Build: {{ host_current_build }}"
+          - "Selected Datastore: {{ host_selected_datastore }}"
+          - "Available Space: {{ host_available_space }}GB"
+          - "Pre-check Status: {{ 'PASSED' if precheck_passed else 'FAILED' }}"
+          - "========================================="
+          
+    - name: Save pre-check results for later use
+      set_stats:
+        data:
+          "{{ inventory_hostname }}_precheck": "{{ 'passed' if precheck_passed else 'failed' }}"
+          "{{ inventory_hostname }}_build": "{{ host_current_build }}"
+          "{{ inventory_hostname }}_datastore": "{{ host_selected_datastore }}"
