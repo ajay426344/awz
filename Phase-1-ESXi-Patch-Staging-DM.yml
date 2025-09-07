@@ -38,7 +38,7 @@
 
         - name: Upload patch file to ESXi host
           copy:
-            src: "{{ patch_source }}/{{ patch_file }}"
+            src: "{{ patch_file }}"
             dest: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
             mode: '0644'
           when: "'NOT_FOUND' in patch_exists.stdout"
