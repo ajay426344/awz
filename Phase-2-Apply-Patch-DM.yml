@@ -200,10 +200,12 @@
           ignore_errors: yes
             
         - name: Issue reboot command
-          raw: esxcli system shutdown reboot --delay=10 --reason=Patching
-          async: 1
-          poll: 0
+          raw: |
+            echo "Issuing reboot command..."
+            esxcli system shutdown reboot --delay=10 --reason=Patching
+            echo "Reboot scheduled"
           ignore_errors: yes
+          failed_when: false
           
         - name: Wait for host to go offline
           wait_for:
