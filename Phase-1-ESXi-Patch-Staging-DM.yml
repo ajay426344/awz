@@ -10,7 +10,7 @@
     patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     # HTTP server configuration
-    http_server_url: "http://192.168.1.100:8080"  # Replace with your HTTP server IP
+    http_server_url: "http://192.168.0.110:8080"  # Replace with your HTTP server IP
     http_patch_path: "/patches"  # Path on HTTP server
     target_build: "24859861"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
