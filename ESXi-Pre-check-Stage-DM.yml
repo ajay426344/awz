@@ -8,7 +8,7 @@
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
-    dynatrace_token: "{{ dynatrace_token}}"
+    dynatrace_token: "{{ dynatrace_token }}"
   
   tasks:
     - name: Set timestamps
