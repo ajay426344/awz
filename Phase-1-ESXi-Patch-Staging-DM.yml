@@ -63,47 +63,18 @@
       block:
         - name: Find best datastore with minimum space
           raw: |
-            SELECTED_DS=""
-            SELECTED_FREE=0
-            MIN_SPACE_GB=3
-            
-            # Check all datastores
-            for DS in /vmfs/volumes/datastore* /vmfs/volumes/[0-9a-f]*; do
-              if [ -d "$DS" ] && [ ! -L "$DS" ]; then
-                # Get free space in bytes first, then convert to GB
-                FREE_BYTES=$(df -B 1 "$DS" 2>/dev/null | tail -1 | awk '{print $4}')
-                if [ ! -z "$FREE_BYTES" ] && [ "$FREE_BYTES" -gt 0 ]; then
-                  # Convert bytes to GB
-                  FREE_GB=$((FREE_BYTES / 1024 / 1024 / 1024))
-                  
-                  # Show the datastore info
-                  echo "Checking $DS: ${FREE_GB}GB free"
-                  
-                  # Select if has enough space and is the best so far
-                  if [ "$FREE_GB" -ge "$MIN_SPACE_GB" ] && [ "$FREE_GB" -gt "$SELECTED_FREE" ]; then
-                    SELECTED_DS="$DS"
-                    SELECTED_FREE=$FREE_GB
-                  fi
-                fi
+            for DS in /vmfs/volumes/datastore*; do
+              if [ -d "$DS" ]; then
+                FREE=$(df -h "$DS" | tail -1 | awk '{print $4}' | sed 's/G//')
+                echo "$DS:$FREE"
               fi
-            done
-            
-            if [ -z "$SELECTED_DS" ]; then
-              # If no datastore found, show what's available
-              echo "ERROR: No datastore with ${MIN_SPACE_GB}GB free"
-              echo "Available datastores:"
-              df -h /vmfs/volumes/* 2>/dev/null | grep -v "^Filesystem"
-              exit 1
-            fi
-            
-            echo "SELECTED:$SELECTED_DS:$SELECTED_FREE"
+            done | sort -t: -k2 -rn | head -1
           register: datastore_check
-          failed_when: datastore_check.rc != 0
           
         - name: Parse datastore selection
           set_fact:
-            datastore_path: "{{ datastore_check.stdout.split(':')[1] }}"
-            patch_path: "{{ datastore_check.stdout.split(':')[1] }}/patches/{{ patch_file }}"
+            datastore_path: "{{ datastore_check.stdout.split(':')[0] }}"
+            patch_path: "{{ datastore_check.stdout.split(':')[0] }}/patches/{{ patch_file }}"
             
         - name: Create patches directory
           raw: mkdir -p "{{ datastore_path }}/patches"
