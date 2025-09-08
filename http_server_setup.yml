@@ -1,0 +1,126 @@
+---
+# Separate playbook to set up HTTP server (run this once on your control node or dedicated server)
+- name: Setup HTTP Server for Patch Distribution
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    http_port: 8080
+    patch_directory: "/var/www/patches"
+    patch_files:
+      - "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    source_patch_directory: "/mnt/patches"
+    
+  tasks:
+    - name: Install required packages for HTTP server
+      package:
+        name:
+          - python3
+          - python3-pip
+        state: present
+      become: yes
+      when: ansible_os_family in ['RedHat', 'Debian']
+      
+    - name: Create patch directory
+      file:
+        path: "{{ patch_directory }}"
+        state: directory
+        mode: '0755'
+      become: yes
+      
+    - name: Copy patch files to HTTP server directory
+      copy:
+        src: "{{ source_patch_directory }}/{{ item }}"
+        dest: "{{ patch_directory }}/{{ item }}"
+        mode: '0644'
+      loop: "{{ patch_files }}"
+      become: yes
+      
+    - name: Create simple HTTP server script
+      copy:
+        dest: "/usr/local/bin/patch-http-server.py"
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import http.server
+          import socketserver
+          import os
+          import sys
+          import signal
+          
+          PORT = {{ http_port }}
+          DIRECTORY = "{{ patch_directory }}"
+          
+          class PatchHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, directory=DIRECTORY, **kwargs)
+              
+              def end_headers(self):
+                  self.send_header('Accept-Ranges', 'bytes')
+                  self.send_header('Cache-Control', 'no-cache')
+                  super().end_headers()
+              
+              def do_GET(self):
+                  print(f"GET request from {self.client_address[0]} for {self.path}")
+                  super().do_GET()
+          
+          def signal_handler(sig, frame):
+              print('\nShutting down HTTP server...')
+              sys.exit(0)
+          
+          signal.signal(signal.SIGINT, signal_handler)
+          
+          os.chdir(DIRECTORY)
+          
+          with socketserver.TCPServer(("", PORT), PatchHTTPRequestHandler) as httpd:
+              print(f"Serving patches at http://0.0.0.0:{PORT}")
+              print(f"Directory: {DIRECTORY}")
+              print("Press Ctrl+C to stop")
+              httpd.serve_forever()
+      become: yes
+      
+    - name: Create systemd service for HTTP server
+      copy:
+        dest: "/etc/systemd/system/esxi-patch-server.service"
+        content: |
+          [Unit]
+          Description=ESXi Patch HTTP Server
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=nobody
+          Group=nogroup
+          WorkingDirectory={{ patch_directory }}
+          ExecStart=/usr/bin/python3 /usr/local/bin/patch-http-server.py
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+      become: yes
+      when: ansible_service_mgr == "systemd"
+      
+    - name: Start and enable patch HTTP server
+      systemd:
+        name: esxi-patch-server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+      when: ansible_service_mgr == "systemd"
+      
+    - name: Verify HTTP server is running
+      uri:
+        url: "http://localhost:{{ http_port }}/"
+        method: GET
+        status_code: 200
+      retries: 3
+      delay: 2
+      
+    - name: Display HTTP server information
+      debug:
+        msg:
+          - "HTTP Server is running on port {{ http_port }}"
+          - "Patch files are served from: {{ patch_directory }}"
+          - "Access patches at: http://{{ ansible_default_ipv4.address }}:{{ http_port }}/patches/"
+          - "Service status: systemctl status esxi-patch-server"
