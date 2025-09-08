@@ -1,5 +1,5 @@
 ---
-- name: Phase 1 - ESXi Patch Staging (Simplified HTTP Download)
+- name: Phase 1 - ESXi Patch Staging with Dynatrace Monitoring (HTTP Distribution)
   hosts: all
   gather_facts: no
   vars:
@@ -9,16 +9,22 @@
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
     patch_profile: "ESXi-8.0U3g-24859861-standard"
-    http_server_url: "http://192.168.0.110:8080"
+    # HTTP server configuration
+    http_server_url: "http://192.168.0.110:8080"  # Your Ansible control node IP
     target_build: "24859861"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
-    skip_connectivity_test: true  # Set to false to enable connectivity test
     
   tasks:
     - name: Set timestamps
       set_fact:
-        phase1_start_time: "{{ now().strftime('%s') }}"
+        current_epoch: "{{ now().strftime('%s') }}"
+        current_iso: "{{ now().isoformat() }}"
+      run_once: true
+      
+    - name: Record phase 1 start time
+      set_fact:
+        phase1_start_time: "{{ current_epoch }}"
         
     - name: Send Phase 1 start event to Dynatrace
       uri:
@@ -36,86 +42,152 @@
             phase: "phase1_staging"
             patch_file: "{{ patch_file }}"
             target_build: "{{ target_build }}"
+            distribution_method: "http"
             severity: "INFO"
         status_code: [200, 201, 202]
       delegate_to: localhost
-      ignore_errors: yes
+      run_once: true
+      become: no
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
       
     - name: Check if patch needed
       set_fact:
         needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
         
+    - name: Send eligibility metric to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
+        status_code: [200, 201, 202, 204]
+      delegate_to: localhost
+      become: no
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          
     - name: Execute staging process
       when: needs_patching
       block:
         - name: Create patches directory
           raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
           
-        - name: Check if patch file already exists
+        - name: Check if patch file already exists locally
           raw: |
-            if [ -f "{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}" ]; then
+            FILE="{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+            if [ -f "$FILE" ]; then
               echo "EXISTS"
-              ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
+              ls -lh "$FILE"
             else
               echo "NOT_FOUND"
             fi
           register: patch_exists
           
-        - name: Display patch status
-          debug:
-            msg: "Patch file status: {{ 'Already exists' if 'EXISTS' in patch_exists.stdout else 'Need to download' }}"
-            
         - name: Download patch from HTTP server
           when: "'NOT_FOUND' in patch_exists.stdout"
           block:
-            - name: Download patch file (Direct approach for ESXi)
+            - name: Record download start time
+              set_fact:
+                download_start: "{{ now().strftime('%s') }}"
+                
+            - name: Display download information
+              debug:
+                msg: "Downloading from: {{ http_server_url }}/{{ patch_file }}"
+                
+            - name: Download patch file from HTTP server (ESXi compatible)
               raw: |
                 cd {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
                 
-                # ESXi uses busybox wget which has limited options
-                # Using simple wget without fancy options
                 echo "Starting download from {{ http_server_url }}/{{ patch_file }}"
                 
-                # Download with basic wget (ESXi compatible)
-                wget -O {{ patch_file }}.tmp "{{ http_server_url }}/{{ patch_file }}" 2>&1
+                # Using basic wget compatible with ESXi busybox
+                wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}" 2>&1
                 
                 if [ $? -eq 0 ]; then
-                  mv {{ patch_file }}.tmp {{ patch_file }}
+                  mv "{{ patch_file }}.tmp" "{{ patch_file }}"
                   echo "Download completed successfully"
-                  ls -lh {{ patch_file }}
+                  ls -lh "{{ patch_file }}"
                 else
-                  rm -f {{ patch_file }}.tmp
+                  rm -f "{{ patch_file }}.tmp"
                   echo "Download failed"
                   exit 1
                 fi
               register: download_result
               retries: 3
-              delay: 30
+              delay: 10
               until: download_result.rc == 0
               
-            - name: Show download result
-              debug:
-                msg: "Download result: {{ download_result.stdout_lines[-3:] }}"
-                
-        - name: Verify patch file exists and is valid
-          raw: |
-            FILE="{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-            if [ -f "$FILE" ]; then
-              SIZE=$(ls -l "$FILE" | awk '{print $5}')
-              echo "File exists: $FILE"
-              echo "Size: $SIZE bytes"
-              if [ $SIZE -gt 1000000 ]; then
-                echo "VALID"
-              else
-                echo "File too small, possibly corrupt"
-                exit 1
-              fi
-            else
-              echo "File not found: $FILE"
-              exit 1
-            fi
-          register: verify_result
-          
+            - name: Verify downloaded file integrity
+              raw: |
+                FILE="{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
+                if [ -f "$FILE" ]; then
+                  SIZE=$(ls -l "$FILE" | awk '{print $5}')
+                  echo "File size: $SIZE bytes"
+                  # Check if file is at least 900MB (reasonable for this patch)
+                  if [ $SIZE -gt 900000000 ]; then
+                    echo "VALID"
+                  else
+                    echo "CORRUPT - File too small"
+                    exit 1
+                  fi
+                else
+                  echo "File not found"
+                  exit 1
+                fi
+              register: file_check
+              failed_when: "'CORRUPT' in file_check.stdout or 'not found' in file_check.stdout"
+              
+            - name: Calculate download duration and send to Dynatrace
+              block:
+                - set_fact:
+                    download_duration: "{{ (now().strftime('%s') | int) - (download_start | int) }}"
+                - uri:
+                    url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+                    method: POST
+                    headers:
+                      Authorization: "Api-Token {{ dynatrace_token }}"
+                      Content-Type: "text/plain; charset=utf-8"
+                    body: |
+                      esxi.patch.phase1.download_duration_seconds,host={{ inventory_hostname }} {{ download_duration }} {{ now().strftime('%s') }}
+                      esxi.patch.phase1.download_method,host={{ inventory_hostname }},method=http 1 {{ now().strftime('%s') }}
+                    status_code: [200, 201, 202, 204]
+                  delegate_to: localhost
+                  become: no
+                  vars:
+                    ansible_connection: local
+                    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+                    
+        - name: Send download status event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "ESXi Patch Download {{ 'Cached' if 'NOT_FOUND' not in patch_exists.stdout else 'Completed' }}"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase1_download"
+                status: "{{ 'cached' if 'NOT_FOUND' not in patch_exists.stdout else 'downloaded' }}"
+                download_duration: "{{ download_duration|default('0') }}"
+                http_server: "{{ http_server_url }}"
+                severity: "INFO"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          become: no
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            
         - name: Perform dry-run
           raw: |
             esxcli software profile update \
@@ -125,12 +197,26 @@
           register: dry_run_result
           ignore_errors: yes
           
-        - name: Display dry-run results
+        - name: Display dry-run output
           debug:
-            msg: 
-              - "Dry-run return code: {{ dry_run_result.rc }}"
-              - "Output: {{ dry_run_result.stdout_lines[:10] if dry_run_result.stdout_lines is defined else 'No output' }}"
-              
+            msg: "Dry-run completed with RC: {{ dry_run_result.rc }}"
+          
+        - name: Send dry-run status to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          delegate_to: localhost
+          become: no
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            
         - name: Stage patch with no-live-install
           raw: |
             esxcli software profile update \
@@ -141,16 +227,33 @@
           
         - name: Display staging results
           debug:
-            msg:
-              - "Staging completed"
-              - "{{ staging_result.stdout_lines[:20] if staging_result.stdout_lines is defined else staging_result.stdout }}"
-              
+            msg: "Staging output: {{ staging_result.stdout_lines[:10] if staging_result.stdout_lines is defined else 'Check full output' }}"
+          
         - name: Validate staging success
           set_fact:
             staging_success: "{{ 'The update completed successfully' in staging_result.stdout or 'successfully' in staging_result.stdout|lower }}"
             reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
+            phase1_duration: "{{ (now().strftime('%s') | int) - (phase1_start_time | int) }}"
             
-        - name: Send completion event to Dynatrace
+        - name: Send Phase 1 completion metrics to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          delegate_to: localhost
+          become: no
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          
+        - name: Send Phase 1 completion event to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/events/ingest"
             method: POST
@@ -165,20 +268,70 @@
                 host: "{{ inventory_hostname }}"
                 phase: "phase1_staging"
                 status: "{{ 'success' if staging_success else 'failed' }}"
+                duration_seconds: "{{ phase1_duration }}"
                 reboot_required: "{{ reboot_required }}"
+                distribution_method: "http"
                 severity: "{{ 'INFO' if staging_success else 'ERROR' }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
-          ignore_errors: yes
-          
+          become: no
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+            
       rescue:
-        - name: Handle failures
-          debug:
-            msg: 
-              - "Task failed: {{ ansible_failed_task.name|default('Unknown task') }}"
-              - "Error: {{ ansible_failed_result.msg|default('No error message') }}"
-              
-        - name: Cleanup on failure
+        - name: Send failure event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_ALERT"
+              title: "ESXi Phase 1 Failed"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase1_staging"
+                status: "failed"
+                error: "{{ ansible_failed_result.msg|default('Unknown error') }}"
+                severity: "ERROR"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          become: no
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          ignore_errors: yes
+            
+        - name: Cleanup partial download on failure
           raw: |
             rm -f {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}.tmp 2>/dev/null || true
           ignore_errors: yes
+          
+    - name: Send skip notification if patch not needed
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Skipped - Already Updated"
+          properties:
+            host: "{{ inventory_hostname }}"
+            phase: "phase1_staging"
+            status: "skipped"
+            current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
+            target_build: "{{ target_build }}"
+            severity: "INFO"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      become: no
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      when: not needs_patching
