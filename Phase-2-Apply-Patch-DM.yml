@@ -242,7 +242,7 @@
           pause:
             seconds: 5
             
-        - name: Wait for host to go offline
+        - name: Verify host is going offline
           wait_for:
             host: "{{ ansible_host }}"
             port: 22
@@ -252,26 +252,6 @@
           vars:
             ansible_connection: local
           ignore_errors: yes
-          
-        # Additional verification that host is going down
-        - name: Verify host is going offline via ping
-          shell: |
-            echo "Verifying host is rebooting..."
-            for i in $(seq 1 30); do
-              if ! ping -c 1 -W 2 {{ ansible_host }} > /dev/null 2>&1; then
-                echo "Host is offline (confirmed at attempt $i)"
-                exit 0
-              fi
-              echo "Host still responding (attempt $i/30)"
-              sleep 2
-            done
-            echo "Host may not have rebooted properly"
-            exit 1
-          delegate_to: localhost
-          vars:
-            ansible_connection: local
-          ignore_errors: yes
-          register: ping_offline_check
           
     - name: Wait for host recovery
       block:
