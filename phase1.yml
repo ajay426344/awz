@@ -1,0 +1,224 @@
+---
+# phase1.yml
+# Purpose: Phase 1 - select datastore, ensure patch is on host datastore (host pulls), dry-run and stage (no-live-install)
+# Requires: patch_file, patch_profile, http_server_url, min_free_gb (optional)
+
+- name: Phase1 - Start temporary SSH on ESXi hosts (via API)
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.vmware
+  vars:
+    ssh_service_name: "TSM-SSH"
+    ssh_enable_timeout: 600
+  tasks:
+    - name: Start SSH service on each ESXi via API
+      vmware_host_service_manager:
+        hostname: "{{ item }}"
+        username: "{{ esxi_api_user }}"
+        password: "{{ esxi_api_pass }}"
+        validate_certs: "{{ validate_certs | default(false) }}"
+        service: "{{ ssh_service_name }}"
+        state: started
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      register: ssh_start
+      retries: 3
+      delay: 5
+      until: ssh_start is succeeded
+
+    - name: Wait for SSH reachable for each ESXi
+      wait_for:
+        host: "{{ item }}"
+        port: 22
+        state: started
+        timeout: "{{ ssh_enable_timeout }}"
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      delegate_to: localhost
+
+- name: Phase1 - select datastore, download patch if needed, dry-run & stage (on hosts)
+  hosts: esxi_hosts
+  gather_facts: no
+  serial: 1
+  vars:
+    patch_dir_template: "/vmfs/volumes/{{ datastore }}/patches"
+    patch_path_template: "/vmfs/volumes/{{ datastore }}/patches/{{ patch_file }}"
+    min_free_gb: "{{ min_free_gb | default(3) }}"
+    min_valid_size: 900000000   # bytes threshold for a valid patch file (adjust if needed)
+  tasks:
+    - name: Find best datastore (pick largest with >= min_free_gb else largest overall)
+      raw: |
+        MIN_BYTES=$(( {{ min_free_gb | int }} * 1073741824 ))
+        BEST=""
+        BEST_FREE=0
+        for d in /vmfs/volumes/*; do
+          if [ -d "$d" ]; then
+            NAME=$(basename "$d")
+            FREE=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0)
+            if [ $FREE -ge $MIN_BYTES ] && [ $FREE -gt $BEST_FREE ]; then
+              BEST="$NAME"
+              BEST_FREE=$FREE
+            fi
+          fi
+        done
+        if [ -z "$BEST" ]; then
+          for d in /vmfs/volumes/*; do
+            if [ -d "$d" ]; then
+              NAME=$(basename "$d")
+              FREE=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0)
+              if [ $FREE -gt $BEST_FREE ]; then
+                BEST="$NAME"
+                BEST_FREE=$FREE
+              fi
+            fi
+          done
+        fi
+        echo "${BEST}:${BEST_FREE}"
+      register: datastore_choice
+      changed_when: false
+
+    - name: Set selected datastore & paths
+      set_fact:
+        selected_datastore: "{{ datastore_choice.stdout.split(':')[0] | default('') }}"
+        selected_datastore_free_bytes: "{{ datastore_choice.stdout.split(':')[1] | default('0') }}"
+        selected_datastore_free_gb: "{{ (datastore_choice.stdout.split(':')[1] | default('0') | int) / 1073741824 | float | round(2) }}"
+        patch_dir: "/vmfs/volumes/{{ selected_datastore }}/patches"
+        patch_path: "/vmfs/volumes/{{ selected_datastore }}/patches/{{ patch_file }}"
+
+    - name: Ensure patch directory exists on selected datastore
+      raw: mkdir -p "{{ patch_dir }}" && ls -ld "{{ patch_dir }}"
+      register: mkdir_out
+
+    - name: Check for existing patch file and size
+      raw: |
+        if [ -f "{{ patch_path }}" ]; then
+          stat -c '%s' "{{ patch_path }}"
+        else
+          echo 0
+        fi
+      register: patch_size
+      changed_when: false
+
+    - name: Download patch to datastore from HTTP server if missing or too small
+      raw: |
+        cd "{{ patch_dir }}"
+        wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}" && mv "{{ patch_file }}.tmp" "{{ patch_file }}"
+      register: download
+      retries: 3
+      delay: 30
+      until: download.rc == 0
+      when: patch_size.stdout | int < min_valid_size
+
+    - name: Compute patch checksum (sha256)
+      raw: |
+        if [ -f "{{ patch_path }}" ]; then
+          sha256sum "{{ patch_path }}" | awk '{print $1}'
+        else
+          echo ""
+        fi
+      register: patch_checksum
+      changed_when: false
+
+    - name: Dry-run (verify compatibility) using esxcli
+      raw: |
+        esxcli software profile update -d "{{ patch_path }}" -p "{{ patch_profile }}" --dry-run
+      register: dry_run
+      ignore_errors: yes
+
+    - name: Send phase1 dryrun metric to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if dry_run.rc == 0 else 0 }} {{ now().strftime('%s') }}
+          esxi.patch.phase1.selected_datastore_free_gb,host={{ inventory_hostname }},job_id={{ job_id }} {{ selected_datastore_free_gb }} {{ now().strftime('%s') }}
+        status_code: [200,201,202,204]
+      delegate_to: localhost
+      when: dynatrace_url is defined and dynatrace_token is defined
+
+    - name: If dry-run failed, emit event and fail
+      block:
+        - name: Emit dry-run failed event
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_ANNOTATION"
+              title: "ESXi Phase1 Dry-run FAILED - {{ inventory_hostname }}"
+              properties:
+                host: "{{ inventory_hostname }}"
+                stage: "phase1"
+                job_id: "{{ job_id }}"
+                dry_run_rc: "{{ dry_run.rc }}"
+                selected_datastore: "{{ selected_datastore }}"
+            status_code: [200,201,202]
+          delegate_to: localhost
+          ignore_errors: yes
+      when: dry_run.rc != 0
+
+    - name: Stage patch (no-live-install) if dry-run succeeded
+      raw: |
+        esxcli software profile update -d "{{ patch_path }}" -p "{{ patch_profile }}" --no-live-install
+      register: stage_out
+      when: dry_run.rc == 0
+      ignore_errors: yes
+
+    - name: Send staging metrics & event to Dynatrace
+      block:
+        - name: Send metrics
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.staging_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if stage_out.rc == 0 else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.staging_duration_seconds,host={{ inventory_hostname }},job_id={{ job_id }} {{ 0 }} {{ now().strftime('%s') }}
+            status_code: [200,201,202,204]
+          delegate_to: localhost
+        - name: Send event
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_ANNOTATION"
+              title: "ESXi Phase1 Staging {{ 'Succeeded' if stage_out.rc == 0 else 'Failed' }} - {{ inventory_hostname }}"
+              properties:
+                host: "{{ inventory_hostname }}"
+                stage: "phase1"
+                job_id: "{{ job_id }}"
+                stage_rc: "{{ stage_out.rc | default('') }}"
+            status_code: [200,201,202]
+          delegate_to: localhost
+      when: dry_run.rc == 0
+
+- name: Phase1 - Ensure SSH stopped on ESXi hosts (cleanup)
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.vmware
+  tasks:
+    - name: Stop SSH service on each ESXi via API
+      vmware_host_service_manager:
+        hostname: "{{ item }}"
+        username: "{{ esxi_api_user }}"
+        password: "{{ esxi_api_pass }}"
+        validate_certs: "{{ validate_certs | default(false) }}"
+        service: "{{ ssh_service_name }}"
+        state: stopped
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      register: ssh_stop
+      retries: 3
+      delay: 5
+      until: ssh_stop is succeeded
