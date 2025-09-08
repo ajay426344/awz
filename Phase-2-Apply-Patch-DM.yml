@@ -240,45 +240,30 @@
             seconds: "{{ initial_wait }}"
             prompt: "Waiting {{ initial_wait }} seconds for host to complete reboot..."
             
-        - name: Start checking host availability
-          block:
-            - name: Debug - Show target for ping
-              debug:
-                msg: "Will ping: {{ target_host_ip }}"
-              delegate_to: localhost
-                
-            - name: Wait for host to respond to ping (verbose)
-              shell: |
-                TARGET="{{ target_host_ip }}"
-                echo "Pinging: $TARGET"
-                ping -c 1 -W 2 $TARGET
-                RESULT=$?
-                echo "Exit code: $RESULT"
-                exit $RESULT
-              delegate_to: localhost
-              vars:
-                ansible_connection: local
-              register: ping_check
-              until: ping_check.rc == 0
-              retries: 20
-              delay: 30
-              ignore_errors: yes
-              
         - name: Wait for SSH to be available
           wait_for:
             host: "{{ target_host_ip }}"
             port: 22
             state: started
-            delay: 10
-            timeout: 300
+            delay: 30
+            timeout: 600
+            sleep: 30
           delegate_to: localhost
           vars:
             ansible_connection: local
+          register: ssh_wait_result
             
-        - name: Wait for SSH to be fully ready
+        - name: Display SSH recovery status
+          debug:
+            msg: "SSH is now available on {{ target_host_ip }}"
+          when: ssh_wait_result is success
+          delegate_to: localhost
+            
+        - name: Wait for SSH connection to be fully ready
           wait_for_connection:
             timeout: 300
             delay: 10
+            sleep: 5
             
     - name: Post-reboot tasks
       block:
