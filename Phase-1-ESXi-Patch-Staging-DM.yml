@@ -114,11 +114,12 @@
             
         - name: Check if patch already exists
           raw: |
-            FILE="{{ datastore_path }}/patches/{{ patch_file }}"
+            FILE="{{ patch_full_path }}"
             if [ -f "$FILE" ]; then
               SIZE=$(ls -l "$FILE" | awk '{print $5}')
               echo "STATUS: EXISTS"
               echo "SIZE: $SIZE"
+              echo "PATH: $FILE"
               if [ $SIZE -gt 900000000 ]; then
                 echo "VALID: YES"
               else
@@ -127,6 +128,7 @@
               fi
             else
               echo "STATUS: NOT_FOUND"
+              echo "PATH: $FILE"
             fi
           register: patch_check
           
@@ -240,6 +242,7 @@
         - name: Stage patch (no-live-install)
           raw: |
             echo "Staging patch with no-live-install..."
+            echo "Using patch file: {{ datastore_path }}/patches/{{ patch_file }}"
             esxcli software profile update \
               -d "{{ datastore_path }}/patches/{{ patch_file }}" \
               -p "{{ patch_profile }}" \
@@ -323,8 +326,8 @@
               
         - name: Cleanup on failure
           raw: |
-            rm -f "{{ datastore_path|default(default_datastore) }}/patches/{{ patch_file }}.downloading" 2>/dev/null
-            rm -f "{{ datastore_path|default(default_datastore) }}/patches/{{ patch_file }}.tmp" 2>/dev/null
+            rm -f "{{ patch_full_path|default('/vmfs/volumes/datastore1/patches/' + patch_file) }}.downloading" 2>/dev/null
+            rm -f "{{ patch_full_path|default('/vmfs/volumes/datastore1/patches/' + patch_file) }}.tmp" 2>/dev/null
           ignore_errors: yes
           
         - name: Send failure event to Dynatrace
