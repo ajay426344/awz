@@ -15,6 +15,7 @@
     vm_shutdown_timeout: 300  # 5 minutes for VM shutdown
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+    vm_state_file: "/tmp/vm_state.txt"  # Added missing variable
     
   tasks:
     - name: Phase 2 initialization
@@ -73,6 +74,24 @@
         - name: Parse powered-on VMs
           set_fact:
             powered_on_vms: "{{ (vm_list.stdout | regex_search('POWERED_ON_VMS:(.*)$', '\\1') | first).split() if vm_list.stdout is search('POWERED_ON_VMS:') else [] }}"
+            
+        - name: Save VM state to file for post-reboot restoration
+          raw: |
+            STATE_FILE="{{ vm_state_file }}"
+            VM_IDS="{{ powered_on_vms | join(' ') }}"
+            if [ ! -z "$VM_IDS" ]; then
+              echo "Saving VM state to $STATE_FILE"
+              > "$STATE_FILE"
+              for VMID in $VM_IDS; do
+                NAME=$(vim-cmd vmsvc/get.summary $VMID | grep -E "name = " | cut -d'"' -f2)
+                echo "$VMID:$NAME" >> "$STATE_FILE"
+              done
+              echo "Saved $(echo $VM_IDS | wc -w) VM states"
+              cat "$STATE_FILE"
+            else
+              echo "No VMs to save"
+            fi
+          when: powered_on_vms | length > 0
             
         - name: Display VM shutdown plan
           debug:
@@ -160,6 +179,14 @@
           set_fact:
             reboot_start_time: "{{ now().strftime('%s') }}"
             
+        - name: Verify maintenance mode before reboot
+          raw: esxcli system maintenanceMode get
+          register: mm_check_before_reboot
+          
+        - name: Display maintenance mode status
+          debug:
+            msg: "Maintenance mode status: {{ mm_check_before_reboot.stdout | trim }}"
+            
         - name: Send reboot event to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -174,19 +201,46 @@
               properties:
                 host: "{{ inventory_hostname }}"
                 action: "reboot_initiated"
+                pre_reboot_build: "{{ pre_reboot_build.stdout | trim }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
           vars:
             ansible_connection: local
           ignore_errors: yes
             
-        - name: Issue reboot command
+        # FIXED REBOOT SECTION - Using ESXi native commands
+        - name: Issue reboot command using ESXi native method
           raw: |
-            echo "Initiating reboot..."
-            nohup sh -c 'sleep 2 && reboot' > /dev/null 2>&1 &
-            echo "Reboot command issued"
+            echo "$(date): Initiating ESXi system reboot..."
+            # Use ESXi's native shutdown command with reboot flag
+            esxcli system shutdown reboot --delay=10 --reason="Applying patch build {{ target_build }}"
+            echo "$(date): Reboot command issued successfully"
           register: reboot_cmd
+          async: 1
+          poll: 0
+          ignore_errors: yes
           
+        # Fallback reboot method if ESXi command fails
+        - name: Alternative reboot method (fallback)
+          raw: |
+            # Check if reboot is already scheduled
+            if ! ps | grep -v grep | grep -q "shutdown"; then
+              echo "Using alternative reboot method..."
+              # Direct reboot command
+              /sbin/reboot -f -d 10
+              echo "Alternative reboot command issued"
+            else
+              echo "Reboot already in progress"
+            fi
+          when: reboot_cmd is failed
+          async: 1
+          poll: 0
+          ignore_errors: yes
+          
+        - name: Brief pause to ensure reboot command is processed
+          pause:
+            seconds: 5
+            
         - name: Wait for host to go offline
           wait_for:
             host: "{{ ansible_host }}"
@@ -197,6 +251,26 @@
           vars:
             ansible_connection: local
           ignore_errors: yes
+          
+        # Additional verification that host is going down
+        - name: Verify host is going offline via ping
+          shell: |
+            echo "Verifying host is rebooting..."
+            for i in $(seq 1 30); do
+              if ! ping -c 1 -W 2 {{ ansible_host }} > /dev/null 2>&1; then
+                echo "Host is offline (confirmed at attempt $i)"
+                exit 0
+              fi
+              echo "Host still responding (attempt $i/30)"
+              sleep 2
+            done
+            echo "Host may not have rebooted properly"
+            exit 1
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          register: ping_offline_check
           
     - name: Wait for host recovery
       block:
