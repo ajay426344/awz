@@ -1,5 +1,5 @@
 ---
-- name: Phase 1 - ESXi Patch Staging with HTTP Port 80
+- name: Phase 1 - ESXi Patch Staging
   hosts: all
   gather_facts: no
   vars:
@@ -12,339 +12,166 @@
     patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
     patch_profile: "ESXi-8.0U3g-24859861-standard"
     target_build: "24859861"
-    
-    # HTTP server configuration
     http_server_url: "http://192.168.0.110"
-    
-    # Datastore configuration
-    patches_subdir: "patches"
-    minimum_space_gb: 3  # Minimum free space required in GB
+    minimum_space_gb: 3
     
     # Dynatrace configuration
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
-    enable_dynatrace: true
     
   tasks:
-    - name: Phase 1 Start
-      block:
-        - name: Set start timestamp
-          set_fact:
-            phase1_start_time: "{{ now().strftime('%s') }}"
-            phase1_start_iso: "{{ now().isoformat() }}"
-            
-        - name: Display phase information
-          debug:
-            msg:
-              - "========================================"
-              - "ESXi PATCH PHASE 1 - STAGING"
-              - "========================================"
-              - "Host: {{ inventory_hostname }}"
-              - "HTTP Server: {{ http_server_url }}"
-              - "Patch File: {{ patch_file }}"
-              - "Target Build: {{ target_build }}"
-              - "Started: {{ phase1_start_iso }}"
-              
-        - name: Send start event to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_INFO"
-              title: "ESXi Phase 1 Staging Started"
-              properties:
-                host: "{{ inventory_hostname }}"
-                phase: "phase1_staging"
-                patch_file: "{{ patch_file }}"
-                target_build: "{{ target_build }}"
-                severity: "INFO"
-            status_code: [200, 201, 202]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-          when: enable_dynatrace
-          ignore_errors: yes
-              
-    - name: Pre-flight checks
-      block:
-        - name: Get ESXi version info
-          raw: vmware -vl
-          register: esxi_version
-          
-        - name: Display ESXi version
-          debug:
-            msg: "Current ESXi: {{ esxi_version.stdout_lines[0] if esxi_version.stdout_lines else 'Unknown' }}"
-            
-        - name: Check current build number
-          set_fact:
-            current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('0') }}"
-            needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
-            
-        - name: Display patching decision
-          debug:
-            msg:
-              - "Current Build: {{ current_build }}"
-              - "Target Build: {{ target_build }}"
-              - "Needs Patching: {{ 'YES' if needs_patching else 'NO - Already up to date' }}"
-              
+    - name: Set start timestamp
+      set_fact:
+        phase1_start_time: "{{ now().strftime('%s') }}"
+        
+    - name: Send start event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_INFO"
+          title: "ESXi Phase 1 Staging Started"
+          properties:
+            host: "{{ inventory_hostname }}"
+            patch_file: "{{ patch_file }}"
+            target_build: "{{ target_build }}"
+        status_code: [200, 201, 202]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      ignore_errors: yes
+      
+    - name: Check current ESXi build
+      raw: vmware -vl
+      register: esxi_version
+      
+    - name: Determine if patching needed
+      set_fact:
+        needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
+        
+    - name: Display patching decision
+      debug:
+        msg: "Needs Patching: {{ 'YES' if needs_patching else 'NO' }}"
+        
     - name: Main patching process
       when: needs_patching
       block:
-        # Step 1: Determine datastore path
-        - name: Set datastore path (with space check)
-          when: enable_space_check
-          block:
-            - name: Find datastore with sufficient space
-              raw: |
-                echo "Checking datastores for available space (need {{ minimum_space_gb }}GB+)..."
-                SELECTED_DS=""
-                SELECTED_FREE=0
-                
-                # Check friendly named datastores first
-                for DS in /vmfs/volumes/datastore*; do
-                  if [ -d "$DS" ]; then
-                    FREE_INFO=$(df -h "$DS" 2>/dev/null | tail -1)
-                    FREE_STR=$(echo "$FREE_INFO" | awk '{print $4}')
-                    
-                    if echo "$FREE_STR" | grep -q "G"; then
-                      FREE_GB=$(echo "$FREE_STR" | sed 's/[^0-9].*//')
-                      echo "Datastore: $DS - Free: ${FREE_GB}GB"
-                      
-                      if [ "$FREE_GB" -ge {{ minimum_space_gb }} ] && [ "$FREE_GB" -gt "$SELECTED_FREE" ]; then
-                        SELECTED_DS="$DS"
-                        SELECTED_FREE=$FREE_GB
-                      fi
-                    fi
-                  fi
-                done
-                
-                if [ -z "$SELECTED_DS" ]; then
-                  echo "WARNING: No datastore found with {{ minimum_space_gb }}GB+ free"
-                  echo "Using default: {{ default_datastore }}"
-                  SELECTED_DS="{{ default_datastore }}"
+        - name: Find best datastore with minimum {{ minimum_space_gb }}GB free
+          raw: |
+            SELECTED_DS=""
+            SELECTED_FREE=0
+            
+            for DS in /vmfs/volumes/datastore* /vmfs/volumes/[0-9a-f]*; do
+              if [ -d "$DS" ]; then
+                FREE=$(df -h "$DS" 2>/dev/null | tail -1 | awk '{print $4}' | grep -o '[0-9]*')
+                if [ "$FREE" -ge {{ minimum_space_gb }} ] && [ "$FREE" -gt "$SELECTED_FREE" ]; then
+                  SELECTED_DS="$DS"
+                  SELECTED_FREE=$FREE
                 fi
-                
-                echo "SELECTED_DATASTORE: $SELECTED_DS"
-              register: datastore_check
-              
-            - name: Parse selected datastore
-              set_fact:
-                datastore_base: "{{ datastore_check.stdout | regex_search('SELECTED_DATASTORE: (.+)', '\\1') | first }}"
-              when: datastore_check.rc == 0
-              
-        - name: Set datastore path (without space check)
-          when: not enable_space_check
-          set_fact:
-            datastore_base: "{{ hostvars[inventory_hostname]['host_selected_datastore']|default(default_datastore) }}"
-            
-        # Step 2: Set uniform paths used throughout
-        - name: Set uniform patch paths
-          set_fact:
-            datastore_patches_dir: "{{ datastore_base }}/{{ patches_subdir }}"
-            patch_full_path: "{{ datastore_base }}/{{ patches_subdir }}/{{ patch_file }}"
-            
-        - name: Display selected paths
-          debug:
-            msg:
-              - "Datastore Base: {{ datastore_base }}"
-              - "Patches Directory: {{ datastore_patches_dir }}"
-              - "Full Patch Path: {{ patch_full_path }}"
-              
-        # Step 3: Create directory
-        - name: Ensure patches directory exists
-          raw: |
-            mkdir -p "{{ datastore_patches_dir }}"
-            echo "Created/verified directory: {{ datastore_patches_dir }}"
-            df -h "{{ datastore_base }}" | tail -1
-          register: dir_created
-          
-        - name: Display available space
-          debug:
-            msg: "{{ dir_created.stdout_lines }}"
-            
-        # Step 4: Check if patch exists
-        - name: Check if patch already exists
-          raw: |
-            if [ -f "{{ patch_full_path }}" ]; then
-              SIZE=$(ls -l "{{ patch_full_path }}" | awk '{print $5}')
-              echo "STATUS: EXISTS"
-              echo "PATH: {{ patch_full_path }}"
-              echo "SIZE: $SIZE bytes"
-              if [ $SIZE -gt 900000000 ]; then
-                echo "VALID: YES"
-              else
-                echo "VALID: NO - Too small, will re-download"
-                rm -f "{{ patch_full_path }}"
               fi
-            else
-              echo "STATUS: NOT_FOUND"
-              echo "PATH: {{ patch_full_path }}"
-            fi
-          register: patch_check
-          
-        - name: Display patch status
-          debug:
-            msg: "{{ patch_check.stdout_lines }}"
+            done
             
-        # Step 5: Download if needed
-        - name: Download patch if needed
-          when: "'NOT_FOUND' in patch_check.stdout or 'VALID: NO' in patch_check.stdout"
-          block:
-            - name: Record download start
-              set_fact:
-                download_start: "{{ now().strftime('%s') }}"
-                
-            - name: Enable HTTP client firewall
-              raw: |
-                esxcli network firewall ruleset set -e true -r httpClient
-                echo "httpClient firewall rule enabled"
-                
-            - name: Download patch from HTTP server
-              raw: |
-                cd "{{ datastore_patches_dir }}"
-                echo "Downloading to: {{ datastore_patches_dir }}"
-                echo "URL: {{ http_server_url }}/{{ patch_file }}"
-                
-                wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}"
-                if [ $? -eq 0 ]; then
-                  mv "{{ patch_file }}.tmp" "{{ patch_file }}"
-                  echo "DOWNLOAD: SUCCESS"
-                  ls -lh "{{ patch_file }}"
-                else
-                  rm -f "{{ patch_file }}.tmp"
-                  echo "DOWNLOAD: FAILED"
-                  exit 1
-                fi
-              register: download_result
-              retries: 3
-              delay: 30
-              until: download_result.rc == 0
-              
-            - name: Calculate download time
-              set_fact:
-                download_duration: "{{ (now().strftime('%s')|int) - (download_start|int) }}"
-              when: download_result.rc == 0
-              
-        # Step 6: Verify patch
-        - name: Verify patch integrity
-          raw: |
-            if [ -f "{{ patch_full_path }}" ]; then
-              SIZE=$(ls -l "{{ patch_full_path }}" | awk '{print $5}')
-              echo "File: {{ patch_full_path }}"
-              echo "Size: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
-              if [ $SIZE -gt 900000000 ]; then
-                echo "VALIDATION: PASSED"
-              else
-                echo "VALIDATION: FAILED - File too small"
-                exit 1
-              fi
-            else
-              echo "VALIDATION: FAILED - File not found at {{ patch_full_path }}"
+            if [ -z "$SELECTED_DS" ]; then
+              echo "ERROR: No datastore with {{ minimum_space_gb }}GB free"
               exit 1
             fi
-          register: validation
+            echo "SELECTED:$SELECTED_DS:$SELECTED_FREE"
+          register: datastore_check
+          failed_when: datastore_check.rc != 0
           
-        - name: Display validation result
-          debug:
-            msg: "{{ validation.stdout_lines }}"
+        - name: Parse datastore selection
+          set_fact:
+            datastore_path: "{{ datastore_check.stdout.split(':')[1] }}"
+            patch_path: "{{ datastore_check.stdout.split(':')[1] }}/patches/{{ patch_file }}"
             
-        # Step 7: Run dry-run
-        - name: Perform dry-run test
+        - name: Create patches directory
+          raw: mkdir -p "{{ datastore_path }}/patches"
+          
+        - name: Check if patch exists
           raw: |
-            echo "Running dry-run test..."
-            echo "Patch file: {{ patch_full_path }}"
-            echo "Profile: {{ patch_profile }}"
-            
+            if [ -f "{{ patch_path }}" ]; then
+              SIZE=$(ls -l "{{ patch_path }}" | awk '{print $5}')
+              if [ $SIZE -gt 900000000 ]; then
+                echo "EXISTS_VALID"
+              else
+                rm -f "{{ patch_path }}"
+                echo "NEED_DOWNLOAD"
+              fi
+            else
+              echo "NEED_DOWNLOAD"
+            fi
+          register: patch_status
+          
+        - name: Download patch if needed
+          when: "'NEED_DOWNLOAD' in patch_status.stdout"
+          block:
+            - name: Enable HTTP firewall rule
+              raw: esxcli network firewall ruleset set -e true -r httpClient
+              
+            - name: Download patch
+              raw: |
+                cd "{{ datastore_path }}/patches"
+                wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}"
+                mv "{{ patch_file }}.tmp" "{{ patch_file }}"
+              retries: 3
+              delay: 30
+              until: result.rc == 0
+              register: result
+              
+        - name: Run dry-run test
+          raw: |
             esxcli software profile update \
-              -d "{{ patch_full_path }}" \
+              -d "{{ patch_path }}" \
               -p "{{ patch_profile }}" \
               --dry-run
           register: dry_run
           ignore_errors: yes
           
-        - name: Display dry-run results
-          debug:
-            msg:
-              - "Dry-run RC: {{ dry_run.rc }}"
-              - "{{ dry_run.stdout_lines[:30] if dry_run.stdout_lines else dry_run.stdout }}"
-              
-        # Step 8: Stage patch
-        - name: Stage patch (no-live-install)
+        - name: Stage patch if dry-run succeeded
           raw: |
-            echo "Staging patch with no-live-install..."
-            echo "Patch file: {{ patch_full_path }}"
-            echo "Profile: {{ patch_profile }}"
-            
             esxcli software profile update \
-              -d "{{ patch_full_path }}" \
+              -d "{{ patch_path }}" \
               -p "{{ patch_profile }}" \
               --no-live-install
-          register: staging_result
+          register: staging
           when: dry_run.rc == 0
           
-        - name: Parse staging results
+        - name: Calculate duration
           set_fact:
-            staging_success: "{{ staging_result.rc == 0 and ('successfully' in staging_result.stdout|lower or 'complete' in staging_result.stdout|lower) }}"
-            reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
-            phase1_duration: "{{ (now().strftime('%s')|int) - (phase1_start_time|int) }}"
-          when: staging_result is defined
-          
-        - name: Display final results
-          debug:
-            msg:
-              - "========================================"
-              - "PHASE 1 RESULTS"
-              - "========================================"
-              - "Patch Location: {{ patch_full_path }}"
-              - "Staging: {{ 'SUCCESS ✓' if (staging_result is defined and staging_result.rc == 0) else 'FAILED ✗' }}"
-              - "Reboot Required: {{ reboot_required|default('Unknown') }}"
-              - "Duration: {{ phase1_duration|default('N/A') }} seconds"
-              
-      rescue:
-        - name: Handle staging failure
-          debug:
-            msg:
-              - "========================================"
-              - "PHASE 1 FAILED"
-              - "========================================"
-              - "Task: {{ ansible_failed_task.name|default('Unknown') }}"
-              - "Error: {{ ansible_failed_result.msg|default('Check output above') }}"
-              
-        - name: Cleanup on failure
-          raw: |
-            # Use the paths that were set, with defaults if they weren't
-            PATCH_PATH="{{ patch_full_path|default(default_datastore + '/' + patches_subdir + '/' + patch_file) }}"
-            rm -f "${PATCH_PATH}.tmp" 2>/dev/null
-            rm -f "${PATCH_PATH}.downloading" 2>/dev/null
-            echo "Cleaned up temporary files"
+            duration: "{{ (now().strftime('%s')|int) - (phase1_start_time|int) }}"
+            
+        - name: Send completion metrics to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase1.status,host={{ inventory_hostname }} {{ 1 if staging.rc == 0 else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase1.duration,host={{ inventory_hostname }} {{ duration }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
           ignore_errors: yes
+          when: staging is defined
           
-        - name: Manual fix instructions
+        - name: Display results
           debug:
             msg:
-              - "========================================"
-              - "MANUAL FIX INSTRUCTIONS"
-              - "========================================"
-              - "SSH to ESXi host and run:"
-              - ""
-              - "1. Check file:"
-              - "   ls -la {{ patch_full_path|default('/vmfs/volumes/datastore1/patches/' + patch_file) }}"
-              - ""
-              - "2. Run dry-run:"
-              - "   esxcli software profile update -d {{ patch_full_path|default('/vmfs/volumes/datastore1/patches/' + patch_file) }} -p {{ patch_profile }} --dry-run"
-              - ""
-              - "3. Stage patch:"
-              - "   esxcli software profile update -d {{ patch_full_path|default('/vmfs/volumes/datastore1/patches/' + patch_file) }} -p {{ patch_profile }} --no-live-install"
-              - ""
-              - "4. Reboot:"
-              - "   reboot"
-              
+              - "Staging: {{ 'SUCCESS' if staging.rc == 0 else 'FAILED' }}"
+              - "Duration: {{ duration }} seconds"
+              - "Patch Location: {{ patch_path }}"
+          when: staging is defined
+          
+      rescue:
         - name: Send failure event to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -358,20 +185,24 @@
               title: "ESXi Phase 1 Failed"
               properties:
                 host: "{{ inventory_hostname }}"
-                phase: "phase1_staging"
-                status: "failed"
-                task: "{{ ansible_failed_task.name|default('Unknown') }}"
-                error: "{{ ansible_failed_result.msg|default('Unknown error') }}"
-                severity: "ERROR"
+                error: "{{ ansible_failed_result.msg|default('Unknown') }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
-          become: no
           vars:
             ansible_connection: local
             ansible_python_interpreter: "{{ ansible_playbook_python }}"
-          when: enable_dynatrace
           ignore_errors: yes
           
-        - name: Fail the playbook
+        - name: Cleanup temporary files
+          raw: |
+            find /vmfs/volumes -name "{{ patch_file }}.tmp" -delete 2>/dev/null || true
+          ignore_errors: yes
+          
+        - name: Fail with instructions
           fail:
-            msg: "Phase 1 patching failed. See manual instructions above."
+            msg: |
+              Phase 1 failed. Manual steps:
+              1. SSH to ESXi host
+              2. Find patch: find /vmfs/volumes -name "{{ patch_file }}"
+              3. Run: esxcli software profile update -d [patch_path] -p {{ patch_profile }} --no-live-install
+              4. Reboot when ready
