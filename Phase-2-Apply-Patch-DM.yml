@@ -227,32 +227,16 @@
             
         - name: Start checking host availability
           block:
-            - name: Display target host for debugging
-              debug:
-                msg: "Checking availability of host: {{ ansible_host | default(inventory_hostname) }}"
-              delegate_to: localhost
-              
             - name: Wait for host to respond to ping
-              shell: |
-                TARGET_HOST="{{ ansible_host | default(inventory_hostname) }}"
-                echo "Pinging host: $TARGET_HOST"
-                END_TIME=$(($(date +%s) + {{ max_wait_time - initial_wait }}))
-                ATTEMPT=0
-                while [ $(date +%s) -lt $END_TIME ]; do
-                  ATTEMPT=$((ATTEMPT + 1))
-                  if ping -c 1 -W 2 "$TARGET_HOST" > /dev/null 2>&1; then
-                    echo "Host $TARGET_HOST is responding to ping (attempt $ATTEMPT)"
-                    exit 0
-                  fi
-                  echo "Attempt $ATTEMPT: Host $TARGET_HOST not responding, waiting..."
-                  sleep {{ ping_interval }}
-                done
-                echo "Timeout waiting for ping from $TARGET_HOST"
-                exit 1
+              shell: ping -c 1 -W 2 {{ ansible_host }} > /dev/null 2>&1
               delegate_to: localhost
               vars:
                 ansible_connection: local
               register: ping_check
+              until: ping_check.rc == 0
+              retries: 20
+              delay: 30
+              ignore_errors: yes
               
         - name: Wait for SSH to be available
           wait_for:
