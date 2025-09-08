@@ -9,6 +9,7 @@
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "{{ dynatrace_api_token }}"
+    minimum_space_gb: 3  # Minimum required space in GB
   
   tasks:
     - name: Set timestamps
@@ -50,52 +51,103 @@
       raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
       register: current_build_raw
       
-    - name: Debug - Check all datastores
-      raw: esxcli storage filesystem list
-      register: all_datastores_debug
-      
-    - name: Display all datastores for debugging
-      debug:
-        msg: "{{ all_datastores_debug.stdout_lines }}"
-      
-    - name: Check available datastores with free space (in GB)
+    - name: Check datastore space using esxcli
       raw: |
         esxcli storage filesystem list | grep -E "VMFS|NFS" | while read line; do
-          vol=$(echo "$line" | awk '{print $1}')
+          vol=$(echo "$line" | awk '{print $2}')
+          size=$(echo "$line" | awk '{print $3}')
           free=$(echo "$line" | awk '{print $5}')
-          free_gb=$(echo "$free / 1073741824" | bc 2>/dev/null || echo "0")
-          if [ -z "$free_gb" ]; then free_gb=0; fi
-          echo "${vol}:${free_gb}"
-        done | grep -v ":0$" | head -1
-      register: datastore_info
+          # Convert bytes to GB (divide by 1073741824)
+          if [ "$free" -gt 0 ] 2>/dev/null; then
+            free_gb=$((free / 1073741824))
+            echo "${vol}:${free_gb}"
+          fi
+        done | sort -t: -k2 -rn | head -1
+      register: datastore_esxcli
       
-    - name: Alternative datastore check if first fails
+    - name: Alternative datastore check using vdf
       raw: |
-        df -h | grep -E "VMFS|datastore" | awk '{
-          gsub(/[GMK]/, "", $4);
-          if ($4 > 3) print $6":"$4
-        }' | head -1
-      register: datastore_alt
-      when: datastore_info.stdout == ""
+        vdf -h 2>/dev/null | grep -E "VMFS|NFS" | while read line; do
+          vol=$(echo "$line" | awk '{print $1}')
+          avail=$(echo "$line" | awk '{print $4}')
+          # Extract number and convert if needed
+          if echo "$avail" | grep -q "G"; then
+            free_gb=$(echo "$avail" | sed 's/G//')
+          elif echo "$avail" | grep -q "T"; then
+            free_gb=$(echo "$avail" | sed 's/T//' | awk '{print int($1 * 1024)}')
+          else
+            free_gb=0
+          fi
+          echo "${vol}:${free_gb}"
+        done | sort -t: -k2 -rn | head -1
+      register: datastore_vdf
+      when: datastore_esxcli.stdout == ""
       
-    - name: Debug datastore results
+    - name: Fallback datastore check using df
+      raw: |
+        df -h | grep "/vmfs/volumes/" | while read line; do
+          vol=$(echo "$line" | awk '{print $6}')
+          avail=$(echo "$line" | awk '{print $4}')
+          # Extract number and convert if needed
+          if echo "$avail" | grep -q "G"; then
+            free_gb=$(echo "$avail" | sed 's/G//' | awk '{print int($1)}')
+          elif echo "$avail" | grep -q "T"; then
+            free_gb=$(echo "$avail" | sed 's/T//' | awk '{print int($1 * 1024)}')
+          elif echo "$avail" | grep -q "M"; then
+            free_gb=0
+          else
+            free_gb=0
+          fi
+          if [ "$free_gb" -gt 0 ]; then
+            echo "${vol}:${free_gb}"
+          fi
+        done | sort -t: -k2 -rn | head -1
+      register: datastore_df
+      when: 
+        - datastore_esxcli.stdout == ""
+        - datastore_vdf.stdout | default("") == ""
+      
+    - name: Debug all datastore check results
       debug:
         msg:
-          - "Primary check result: {{ datastore_info.stdout }}"
-          - "Alternative check result: {{ datastore_alt.stdout | default('not run') }}"
+          - "esxcli result: {{ datastore_esxcli.stdout | default('empty') }}"
+          - "vdf result: {{ datastore_vdf.stdout | default('not run or empty') }}"
+          - "df result: {{ datastore_df.stdout | default('not run or empty') }}"
+      
+    - name: Parse datastore information
+      set_fact:
+        datastore_result: >-
+          {%- if datastore_esxcli.stdout and ':' in datastore_esxcli.stdout -%}
+            {{ datastore_esxcli.stdout | trim }}
+          {%- elif datastore_vdf.stdout | default("") and ':' in datastore_vdf.stdout -%}
+            {{ datastore_vdf.stdout | trim }}
+          {%- elif datastore_df.stdout | default("") and ':' in datastore_df.stdout -%}
+            {{ datastore_df.stdout | trim }}
+          {%- else -%}
+            none:0
+          {%- endif -%}
       
     - name: Set host facts
       set_fact:
         host_ssh_status: "{{ 'PASS' if ssh_check.elapsed < 30 else 'FAIL' }}"
         host_current_build: "{{ current_build_raw.stdout | trim }}"
         host_version: "{{ version_output.stdout | trim }}"
-        host_selected_datastore: "{{ (datastore_info.stdout.split(':')[0] if datastore_info.stdout else datastore_alt.stdout.split(':')[0]) if (datastore_info.stdout or datastore_alt.stdout | default('')) else '/vmfs/volumes/datastore1' }}"
-        host_available_space: "{{ (datastore_info.stdout.split(':')[1] if datastore_info.stdout else datastore_alt.stdout.split(':')[1]) if (datastore_info.stdout or datastore_alt.stdout | default('')) else '0' }}"
+        host_selected_datastore: "{{ datastore_result.split(':')[0] if ':' in datastore_result else 'none' }}"
+        host_available_space: "{{ datastore_result.split(':')[1] | int if ':' in datastore_result else 0 }}"
         precheck_timestamp: "{{ current_epoch }}"
         
     - name: Determine pre-check status
       set_fact:
-        precheck_passed: "{{ host_ssh_status == 'PASS' and (host_available_space|float > 3 or all_datastores_debug.stdout is search('VMFS')) }}"
+        precheck_passed: "{{ host_ssh_status == 'PASS' and host_available_space | int >= minimum_space_gb | int }}"
+        precheck_warnings: >-
+          {%- set warnings = [] -%}
+          {%- if host_ssh_status != 'PASS' -%}
+            {%- set _ = warnings.append('SSH connectivity issue') -%}
+          {%- endif -%}
+          {%- if host_available_space | int < minimum_space_gb | int -%}
+            {%- set _ = warnings.append('Insufficient datastore space: ' + host_available_space | string + 'GB available, ' + minimum_space_gb | string + 'GB required') -%}
+          {%- endif -%}
+          {{ warnings | join(', ') if warnings else 'None' }}
         
     - name: Send pre-check metrics to Dynatrace
       uri:
@@ -131,8 +183,10 @@
             status: "{{ 'passed' if precheck_passed else 'failed' }}"
             current_build: "{{ host_current_build }}"
             available_space_gb: "{{ host_available_space }}"
+            required_space_gb: "{{ minimum_space_gb }}"
             ssh_status: "{{ host_ssh_status }}"
-            severity: "{{ 'INFO' if precheck_passed else 'WARNING' }}"
+            warnings: "{{ precheck_warnings }}"
+            severity: "{{ 'INFO' if precheck_passed else 'ERROR' }}"
         status_code: [200, 201, 202]
       delegate_to: localhost
       vars:
@@ -145,18 +199,21 @@
           - "Host: {{ inventory_hostname }}"
           - "SSH Status: {{ host_ssh_status }}"
           - "Current Build: {{ host_current_build }}"
-          - "Available Space: {{ host_available_space }}GB"
-          - "Pre-check Status: {{ 'PASSED' if precheck_passed else 'FAILED' }}"
+          - "Selected Datastore: {{ host_selected_datastore }}"
+          - "Available Space: {{ host_available_space }}GB (Required: {{ minimum_space_gb }}GB)"
+          - "Pre-check Status: {{ 'PASSED ✓' if precheck_passed else 'FAILED ✗' }}"
+          - "Warnings: {{ precheck_warnings }}"
           - "========================================="
           
-    - name: Save pre-check results (with sanitized variable names)
+    - name: Fail if pre-check doesn't pass
+      fail:
+        msg: "Pre-check failed! {{ precheck_warnings }}"
+      when: not precheck_passed
+          
+    - name: Save pre-check results
       set_stats:
         data:
           "{{ inventory_hostname | replace('-', '_') }}_precheck": "{{ 'passed' if precheck_passed else 'failed' }}"
           "{{ inventory_hostname | replace('-', '_') }}_build": "{{ host_current_build }}"
           "{{ inventory_hostname | replace('-', '_') }}_datastore": "{{ host_selected_datastore }}"
-          "host_precheck_{{ inventory_hostname | replace('-', '_') }}": 
-            status: "{{ 'passed' if precheck_passed else 'failed' }}"
-            build: "{{ host_current_build }}"
-            datastore: "{{ host_selected_datastore }}"
-            available_space_gb: "{{ host_available_space }}"
+          "{{ inventory_hostname | replace('-', '_') }}_space_gb": "{{ host_available_space }}"
