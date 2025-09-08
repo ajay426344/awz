@@ -65,7 +65,7 @@
           raw: |
             SELECTED_DS=""
             SELECTED_FREE=0
-            MIN_SPACE_GB={{ minimum_space_gb }}
+            MIN_SPACE_GB=3
             
             # Check all datastores
             for DS in /vmfs/volumes/datastore* /vmfs/volumes/[0-9a-f]*; do
