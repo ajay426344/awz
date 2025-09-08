@@ -15,7 +15,7 @@ patch_repository: "/mnt/patches"
 
 # Dynatrace configuration
 dynatrace_url: "https://ofp39563.live.dynatrace.com"
-dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+dynatrace_token: "{{ dynatrace_token }}"
 
 # Configurable thresholds
 default_threshold_minutes: 10
