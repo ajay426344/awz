@@ -34,15 +34,16 @@
           raw: ls -lh {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} 2>/dev/null || echo "NOT_FOUND"
           register: patch_exists
           
-        - name: Transfer patch file using SCP (with progress monitoring)
-          raw: |
-            echo "Starting SCP transfer of {{ patch_file }}..."
+        - name: Transfer patch file using SCP from control node
+          shell: |
+            echo "Starting SCP transfer of {{ patch_file }} to {{ inventory_hostname }}..."
             scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -v \
-                {{ scp_source_host }}:{{ patch_source }}/{{ patch_file }} \
-                {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
+                {{ patch_source }}/{{ patch_file }} \
+                root@{{ inventory_hostname }}:{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}
             echo "SCP transfer completed with exit code: $?"
           when: "'NOT_FOUND' in patch_exists.stdout"
           register: scp_result
+          delegate_to: localhost
           
         - name: Display SCP transfer status
           debug:
