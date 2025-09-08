@@ -211,10 +211,11 @@
         # FIXED REBOOT SECTION - Using ESXi native commands
         - name: Issue reboot command using ESXi native method
           raw: |
-            echo "$(date): Initiating ESXi system reboot..."
+            echo "Initiating ESXi system reboot..."
             # Use ESXi's native shutdown command with reboot flag
-            esxcli system shutdown reboot --delay=10 --reason="Applying patch build {{ target_build }}"
-            echo "$(date): Reboot command issued successfully"
+            REASON="Applying patch build {{ target_build }}"
+            esxcli system shutdown reboot --delay=10 --reason="${REASON}"
+            echo "Reboot command issued successfully"
           register: reboot_cmd
           async: 1
           poll: 0
