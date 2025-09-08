@@ -1,5 +1,5 @@
 ---
-- name: Phase 1 - ESXi Patch Staging with Dynatrace Monitoring (HTTP Distribution)
+- name: Fix ESXi Network Connectivity for HTTP Downloads
   hosts: all
   gather_facts: no
   vars:
@@ -7,331 +7,163 @@
     ansible_password: "Ajay@426344"
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
-    patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
-    patch_profile: "ESXi-8.0U3g-24859861-standard"
-    # HTTP server configuration
-    http_server_url: "http://192.168.0.110:8080"  # Your Ansible control node IP
-    target_build: "24859861"
-    dynatrace_url: "https://ofp39563.live.dynatrace.com"
-    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+    http_server_ip: "192.168.0.110"
+    http_server_port: "8080"
     
   tasks:
-    - name: Set timestamps
-      set_fact:
-        current_epoch: "{{ now().strftime('%s') }}"
-        current_iso: "{{ now().isoformat() }}"
-      run_once: true
+    - name: Check current network configuration
+      raw: |
+        echo "=== Network Configuration ==="
+        esxcli network ip interface list
+        echo ""
+        echo "=== Routing Table ==="
+        esxcli network ip route ipv4 list
+        echo ""
+        echo "=== DNS Configuration ==="
+        esxcli network ip dns server list
+      register: network_config
       
-    - name: Record phase 1 start time
-      set_fact:
-        phase1_start_time: "{{ current_epoch }}"
+    - name: Display network configuration
+      debug:
+        msg: "{{ network_config.stdout_lines }}"
         
-    - name: Send Phase 1 start event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Phase 1 Staging Started"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase1_staging"
-            patch_file: "{{ patch_file }}"
-            target_build: "{{ target_build }}"
-            distribution_method: "http"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      run_once: true
-      become: no
-      vars:
-        ansible_connection: local
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    - name: Test connectivity to HTTP server
+      raw: |
+        echo "=== Testing connectivity to {{ http_server_ip }} ==="
+        ping -c 3 {{ http_server_ip }}
+        PING_RESULT=$?
+        
+        if [ $PING_RESULT -ne 0 ]; then
+          echo "ERROR: Cannot ping HTTP server"
+          echo "Checking ARP table:"
+          esxcli network ip neighbor list
+        else
+          echo "SUCCESS: Can ping HTTP server"
+        fi
+      register: ping_test
       
-    - name: Check if patch needed
-      set_fact:
-        needs_patching: "{{ hostvars[inventory_hostname]['host_current_build']|default('0')|int < target_build|int }}"
+    - name: Display ping test results
+      debug:
+        msg: "{{ ping_test.stdout_lines }}"
         
-    - name: Send eligibility metric to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "text/plain; charset=utf-8"
-        body: |
-          esxi.patch.phase1.eligibility,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ phase1_start_time }}
-        status_code: [200, 201, 202, 204]
-      delegate_to: localhost
-      become: no
-      vars:
-        ansible_connection: local
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    - name: Check and fix ESXi firewall for HTTP client
+      raw: |
+        echo "=== Current Firewall Status ==="
+        esxcli network firewall get
+        
+        echo -e "\n=== HTTP Related Rules ==="
+        esxcli network firewall ruleset list | grep -E "httpClient|http"
+        
+        echo -e "\n=== Enabling httpClient ruleset ==="
+        esxcli network firewall ruleset set -e true -r httpClient
+        
+        echo -e "\n=== Verifying httpClient is enabled ==="
+        esxcli network firewall ruleset list | grep httpClient
+        
+        echo -e "\n=== Checking allowed IPs for httpClient ==="
+        esxcli network firewall ruleset allowedip list -r httpClient
+      register: firewall_fix
+      
+    - name: Display firewall fix results
+      debug:
+        msg: "{{ firewall_fix.stdout_lines }}"
+        
+    - name: Add specific IP to httpClient ruleset if needed
+      raw: |
+        echo "=== Adding {{ http_server_ip }} to httpClient allowed IPs ==="
+        
+        # First, check if we need to allow all IPs temporarily
+        esxcli network firewall ruleset set -e true -r httpClient
+        esxcli network firewall ruleset allowedip add -r httpClient -i {{ http_server_ip }}
+        
+        # Or allow all IPs (less secure but works for testing)
+        # esxcli network firewall ruleset set -a true -r httpClient
+        
+        echo "=== Updated allowed IPs ==="
+        esxcli network firewall ruleset allowedip list -r httpClient
+      register: firewall_ip
+      
+    - name: Display firewall IP results
+      debug:
+        msg: "{{ firewall_ip.stdout_lines }}"
+        
+    - name: Test HTTP connectivity with curl
+      raw: |
+        echo "=== Testing HTTP with curl ==="
+        if command -v curl >/dev/null 2>&1; then
+          curl -I --connect-timeout 5 http://{{ http_server_ip }}:{{ http_server_port }}/
+        else
+          echo "curl not available, testing with wget"
+          wget --spider --timeout=5 http://{{ http_server_ip }}:{{ http_server_port }}/ 2>&1
+        fi
+      register: http_test
+      
+    - name: Display HTTP test results
+      debug:
+        msg: "{{ http_test.stdout_lines }}"
+        
+    - name: Test with nc (netcat) if available
+      raw: |
+        echo "=== Testing port {{ http_server_port }} with nc ==="
+        if command -v nc >/dev/null 2>&1; then
+          echo "GET / HTTP/1.0\r\n\r\n" | nc -w 5 {{ http_server_ip }} {{ http_server_port }} | head -5
+        else
+          echo "nc not available"
+        fi
+      register: nc_test
+      failed_when: false
+      
+    - name: Display nc test results
+      debug:
+        msg: "{{ nc_test.stdout_lines }}"
+      when: nc_test.rc == 0
+      
+    - name: Alternative - Set up local port forwarding (if needed)
+      debug:
+        msg:
+          - "If the above doesn't work, you may need to:"
+          - "1. Check if HTTP server is bound to all interfaces (0.0.0.0:8080 not just 127.0.0.1:8080)"
+          - "2. Check HTTP server's firewall (on {{ http_server_ip }})"
+          - "3. Verify no network segmentation between ESXi and HTTP server"
+          - "4. Consider using a different port (80, 443)"
           
-    - name: Execute staging process
-      when: needs_patching
-      block:
-        - name: Create patches directory
-          raw: mkdir -p {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
-          
-        - name: Check if patch file already exists locally
-          raw: |
-            FILE="{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-            if [ -f "$FILE" ]; then
-              echo "EXISTS"
-              ls -lh "$FILE"
-            else
-              echo "NOT_FOUND"
-            fi
-          register: patch_exists
-          
-        - name: Download patch from HTTP server
-          when: "'NOT_FOUND' in patch_exists.stdout"
-          block:
-            - name: Record download start time
-              set_fact:
-                download_start: "{{ now().strftime('%s') }}"
-                
-            - name: Display download information
-              debug:
-                msg: "Downloading from: {{ http_server_url }}/{{ patch_file }}"
-                
-            - name: Download patch file from HTTP server (ESXi compatible)
-              raw: |
-                cd {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches
-                
-                echo "Starting download from {{ http_server_url }}/{{ patch_file }}"
-                
-                # Using basic wget compatible with ESXi busybox
-                wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}" 2>&1
-                
-                if [ $? -eq 0 ]; then
-                  mv "{{ patch_file }}.tmp" "{{ patch_file }}"
-                  echo "Download completed successfully"
-                  ls -lh "{{ patch_file }}"
-                else
-                  rm -f "{{ patch_file }}.tmp"
-                  echo "Download failed"
-                  exit 1
-                fi
-              register: download_result
-              retries: 3
-              delay: 10
-              until: download_result.rc == 0
-              
-            - name: Verify downloaded file integrity
-              raw: |
-                FILE="{{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}"
-                if [ -f "$FILE" ]; then
-                  SIZE=$(ls -l "$FILE" | awk '{print $5}')
-                  echo "File size: $SIZE bytes"
-                  # Check if file is at least 900MB (reasonable for this patch)
-                  if [ $SIZE -gt 900000000 ]; then
-                    echo "VALID"
-                  else
-                    echo "CORRUPT - File too small"
-                    exit 1
-                  fi
-                else
-                  echo "File not found"
-                  exit 1
-                fi
-              register: file_check
-              failed_when: "'CORRUPT' in file_check.stdout or 'not found' in file_check.stdout"
-              
-            - name: Calculate download duration and send to Dynatrace
-              block:
-                - set_fact:
-                    download_duration: "{{ (now().strftime('%s') | int) - (download_start | int) }}"
-                - uri:
-                    url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-                    method: POST
-                    headers:
-                      Authorization: "Api-Token {{ dynatrace_token }}"
-                      Content-Type: "text/plain; charset=utf-8"
-                    body: |
-                      esxi.patch.phase1.download_duration_seconds,host={{ inventory_hostname }} {{ download_duration }} {{ now().strftime('%s') }}
-                      esxi.patch.phase1.download_method,host={{ inventory_hostname }},method=http 1 {{ now().strftime('%s') }}
-                    status_code: [200, 201, 202, 204]
-                  delegate_to: localhost
-                  become: no
-                  vars:
-                    ansible_connection: local
-                    ansible_python_interpreter: "{{ ansible_playbook_python }}"
-                    
-        - name: Send download status event to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_INFO"
-              title: "ESXi Patch Download {{ 'Cached' if 'NOT_FOUND' not in patch_exists.stdout else 'Completed' }}"
-              properties:
-                host: "{{ inventory_hostname }}"
-                phase: "phase1_download"
-                status: "{{ 'cached' if 'NOT_FOUND' not in patch_exists.stdout else 'downloaded' }}"
-                download_duration: "{{ download_duration|default('0') }}"
-                http_server: "{{ http_server_url }}"
-                severity: "INFO"
-            status_code: [200, 201, 202]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-            
-        - name: Perform dry-run
-          raw: |
-            esxcli software profile update \
-              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
-              -p {{ patch_profile }} \
-              --dry-run
-          register: dry_run_result
-          ignore_errors: yes
-          
-        - name: Display dry-run output
-          debug:
-            msg: "Dry-run completed with RC: {{ dry_run_result.rc }}"
-          
-        - name: Send dry-run status to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "text/plain; charset=utf-8"
-            body: |
-              esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }} {{ 1 if dry_run_result.rc == 0 else 0 }} {{ now().strftime('%s') }}
-            status_code: [200, 201, 202, 204]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-            
-        - name: Stage patch with no-live-install
-          raw: |
-            esxcli software profile update \
-              -d {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }} \
-              -p {{ patch_profile }} \
-              --no-live-install
-          register: staging_result
-          
-        - name: Display staging results
-          debug:
-            msg: "Staging output: {{ staging_result.stdout_lines[:10] if staging_result.stdout_lines is defined else 'Check full output' }}"
-          
-        - name: Validate staging success
-          set_fact:
-            staging_success: "{{ 'The update completed successfully' in staging_result.stdout or 'successfully' in staging_result.stdout|lower }}"
-            reboot_required: "{{ 'Reboot Required: true' in staging_result.stdout }}"
-            phase1_duration: "{{ (now().strftime('%s') | int) - (phase1_start_time | int) }}"
-            
-        - name: Send Phase 1 completion metrics to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "text/plain; charset=utf-8"
-            body: |
-              esxi.patch.phase1.staging_status,host={{ inventory_hostname }} {{ 1 if staging_success else 0 }} {{ now().strftime('%s') }}
-              esxi.patch.phase1.reboot_required,host={{ inventory_hostname }} {{ 1 if reboot_required else 0 }} {{ now().strftime('%s') }}
-              esxi.patch.phase1.duration_seconds,host={{ inventory_hostname }} {{ phase1_duration }} {{ now().strftime('%s') }}
-            status_code: [200, 201, 202, 204]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-          
-        - name: Send Phase 1 completion event to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_INFO"
-              title: "ESXi Phase 1 {{ 'Completed' if staging_success else 'Failed' }}"
-              properties:
-                host: "{{ inventory_hostname }}"
-                phase: "phase1_staging"
-                status: "{{ 'success' if staging_success else 'failed' }}"
-                duration_seconds: "{{ phase1_duration }}"
-                reboot_required: "{{ reboot_required }}"
-                distribution_method: "http"
-                severity: "{{ 'INFO' if staging_success else 'ERROR' }}"
-            status_code: [200, 201, 202]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-            
-      rescue:
-        - name: Send failure event to Dynatrace
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_ALERT"
-              title: "ESXi Phase 1 Failed"
-              properties:
-                host: "{{ inventory_hostname }}"
-                phase: "phase1_staging"
-                status: "failed"
-                error: "{{ ansible_failed_result.msg|default('Unknown error') }}"
-                severity: "ERROR"
-            status_code: [200, 201, 202]
-          delegate_to: localhost
-          become: no
-          vars:
-            ansible_connection: local
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-          ignore_errors: yes
-            
-        - name: Cleanup partial download on failure
-          raw: |
-            rm -f {{ hostvars[inventory_hostname]['host_selected_datastore']|default('/vmfs/volumes/datastore1') }}/patches/{{ patch_file }}.tmp 2>/dev/null || true
-          ignore_errors: yes
-          
-    - name: Send skip notification if patch not needed
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Phase 1 Skipped - Already Updated"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase1_staging"
-            status: "skipped"
-            current_build: "{{ hostvars[inventory_hostname]['host_current_build']|default('unknown') }}"
-            target_build: "{{ target_build }}"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      become: no
-      vars:
-        ansible_connection: local
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
-      when: not needs_patching
+    - name: Try alternative approach - Mount NFS datastore
+      debug:
+        msg:
+          - "Alternative: Mount patch directory as NFS datastore"
+          - "On HTTP server ({{ http_server_ip }}):"
+          - "  1. apt-get install nfs-kernel-server"
+          - "  2. echo '/var/www/patches *(ro,sync,no_subtree_check)' >> /etc/exports"
+          - "  3. systemctl restart nfs-kernel-server"
+          - "On ESXi:"
+          - "  esxcli storage nfs41 add -H {{ http_server_ip }} -s /var/www/patches -v patches"
+
+---
+- name: Alternative - Local HTTP Server on Different Port
+  hosts: localhost
+  gather_facts: no
+  vars:
+    patch_file: "VMware-ESXi-8.0U3g-24859861-depot.zip"
+    patch_directory: "/var/www/patches"
+    
+  tasks:
+    - name: Check if we can use standard HTTP port 80
+      shell: |
+        sudo lsof -i:80 2>/dev/null | grep LISTEN || echo "Port 80 is free"
+      register: port80_check
+      
+    - name: Start HTTP server on port 80 if available
+      shell: |
+        cd {{ patch_directory }}
+        sudo python3 -m http.server 80 &
+        sleep 2
+        curl -I http://localhost/{{ patch_file }} | head -3
+      when: "'Port 80 is free' in port80_check.stdout"
+      register: http80_server
+      
+    - name: Display alternative server info
+      debug:
+        msg: 
+          - "If port 8080 is blocked, try port 80:"
+          - "sudo python3 -m http.server 80 --directory {{ patch_directory }}"
+          - "Then update playbook with: http_server_url: 'http://192.168.0.110'"
