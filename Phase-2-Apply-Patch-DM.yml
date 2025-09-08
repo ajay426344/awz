@@ -1,5 +1,5 @@
 ---
-- name: Phase 2 - Apply Patch with Dynatrace Monitoring
+- name: Phase 2 - Apply Patch with VM Management
   hosts: all
   gather_facts: no
   serial: 1
@@ -9,237 +9,405 @@
     ansible_connection: ssh
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
     target_build: "24859861"
-    grace_period: 120
-    max_wait_time: 900
+    initial_wait: 180  # 3 minutes initial wait
+    ping_interval: 30   # Check every 30 seconds
+    max_wait_time: 900  # 15 minutes total timeout
+    vm_shutdown_timeout: 300  # 5 minutes for VM shutdown
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
     
   tasks:
-    - name: Set timestamps
-      set_fact:
-        current_epoch: "{{ now().strftime('%s') }}"
-        current_iso: "{{ now().isoformat() }}"
-      run_once: true
-      
-    - name: Record Phase 2 start time
-      set_fact:
-        phase2_start_time: "{{ current_epoch }}"
-        
-    - name: Send Phase 2 start event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Phase 2 Reboot Started"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_reboot"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-        
-    - name: Get pre-reboot build
-      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
-      register: pre_reboot_build
-      
+    - name: Phase 2 initialization
+      block:
+        - name: Set Phase 2 start time
+          set_fact:
+            phase2_start_time: "{{ now().strftime('%s') }}"
+            
+        - name: Send Phase 2 start event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "ESXi Phase 2 Started - VM Management and Reboot"
+              properties:
+                host: "{{ inventory_hostname }}"
+                phase: "phase2_start"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+            
+    - name: Pre-reboot checks
+      block:
+        - name: Get current build version
+          raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+          register: pre_reboot_build
+          
+        - name: Display current build
+          debug:
+            msg: "Current build: {{ pre_reboot_build.stdout | trim }}"
+            
+    - name: VM Management - Shutdown
+      block:
+        - name: Get list of powered-on VMs
+          raw: |
+            echo "=== Getting powered-on VMs ==="
+            POWERED_VMS=""
+            for VMID in $(vim-cmd vmsvc/getallvms | tail -n +2 | awk '{print $1}'); do
+              STATE=$(vim-cmd vmsvc/power.getstate $VMID | tail -1)
+              if echo "$STATE" | grep -q "Powered on"; then
+                NAME=$(vim-cmd vmsvc/get.summary $VMID | grep -E "name = " | cut -d'"' -f2)
+                echo "Found powered-on VM: $NAME (ID: $VMID)"
+                POWERED_VMS="$POWERED_VMS $VMID"
+              fi
+            done
+            echo "POWERED_ON_VMS:$POWERED_VMS"
+          register: vm_list
+          
+        - name: Parse powered-on VMs
+          set_fact:
+            powered_on_vms: "{{ (vm_list.stdout | regex_search('POWERED_ON_VMS:(.*)$', '\\1') | first).split() if vm_list.stdout is search('POWERED_ON_VMS:') else [] }}"
+            
+        - name: Display VM shutdown plan
+          debug:
+            msg: "VMs to shutdown: {{ powered_on_vms | length }} VMs"
+          
+        - name: Send VM shutdown event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "Shutting down {{ powered_on_vms | length }} VMs"
+              properties:
+                host: "{{ inventory_hostname }}"
+                vm_count: "{{ powered_on_vms | length }}"
+                action: "vm_shutdown_start"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          when: powered_on_vms | length > 0
+            
+        - name: Gracefully shutdown all powered-on VMs
+          raw: |
+            echo "Shutting down VMs..."
+            VM_IDS="{{ powered_on_vms | join(' ') }}"
+            if [ ! -z "$VM_IDS" ]; then
+              for VMID in $VM_IDS; do
+                echo "Shutting down VM ID: $VMID"
+                vim-cmd vmsvc/power.shutdown $VMID 2>/dev/null || vim-cmd vmsvc/power.off $VMID
+              done
+              
+              # Wait for VMs to shutdown
+              TIMEOUT={{ vm_shutdown_timeout }}
+              ELAPSED=0
+              while [ $ELAPSED -lt $TIMEOUT ]; do
+                RUNNING=0
+                for VMID in $VM_IDS; do
+                  STATE=$(vim-cmd vmsvc/power.getstate $VMID | tail -1)
+                  if echo "$STATE" | grep -q "Powered on"; then
+                    RUNNING=$((RUNNING + 1))
+                  fi
+                done
+                
+                if [ $RUNNING -eq 0 ]; then
+                  echo "All VMs shutdown successfully"
+                  break
+                fi
+                
+                echo "Waiting for $RUNNING VMs to shutdown..."
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+              done
+            else
+              echo "No VMs to shutdown"
+            fi
+          register: vm_shutdown
+          when: powered_on_vms | length > 0
+          
     - name: Enter maintenance mode
-      raw: esxcli system maintenanceMode set --enable true
-      register: mm_enable
-      
-    - name: Send maintenance mode event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Host Entered Maintenance Mode"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_reboot"
-            action: "maintenance_mode_enabled"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Record reboot start time
-      set_fact:
-        reboot_start_time: "{{ now().strftime('%s') }}"
-      
-    - name: Send reboot initiated event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Host Rebooting"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_reboot"
-            action: "reboot_initiated"
-            severity: "WARNING"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Initiate reboot
-      raw: reboot
-      async: 1
-      poll: 0
-      
-    - name: Wait for host offline
-      wait_for:
-        host: "{{ ansible_host }}"
-        port: 22
-        state: stopped
-        timeout: 120
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Grace period
-      pause:
-        seconds: "{{ grace_period }}"
-        
-    - name: Wait for host online
-      wait_for:
-        host: "{{ ansible_host }}"
-        port: 22
-        state: started
-        delay: 30
-        timeout: "{{ max_wait_time }}"
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      register: host_recovery
-      
-    - name: Send host recovered event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Host Back Online"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_reboot"
-            action: "host_recovered"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Calculate downtime
-      set_fact:
-        downtime_seconds: "{{ (now().strftime('%s') | int) - (reboot_start_time | int) }}"
-        
-    - name: Wait for SSH ready
-      wait_for_connection:
-        timeout: 300
-        
+      block:
+        - name: Check maintenance mode status
+          raw: esxcli system maintenanceMode get
+          register: mm_status
+          
+        - name: Enter maintenance mode if needed
+          raw: |
+            if echo "{{ mm_status.stdout }}" | grep -q "Disabled"; then
+              echo "Enabling maintenance mode..."
+              esxcli system maintenanceMode set --enable true
+              echo "Maintenance mode enabled"
+            else
+              echo "Already in maintenance mode"
+            fi
+          register: mm_enable
+          
+    - name: Reboot host
+      block:
+        - name: Record reboot start time
+          set_fact:
+            reboot_start_time: "{{ now().strftime('%s') }}"
+            
+        - name: Send reboot event to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "ESXi Host Rebooting"
+              properties:
+                host: "{{ inventory_hostname }}"
+                action: "reboot_initiated"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+            
+        - name: Issue reboot command
+          raw: |
+            echo "Initiating reboot..."
+            nohup sh -c 'sleep 2 && reboot' > /dev/null 2>&1 &
+            echo "Reboot command issued"
+          register: reboot_cmd
+          
+        - name: Wait for host to go offline
+          wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            state: stopped
+            timeout: 120
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          
+    - name: Wait for host recovery
+      block:
+        - name: Initial wait period (3 minutes)
+          pause:
+            seconds: "{{ initial_wait }}"
+            prompt: "Waiting {{ initial_wait }} seconds for host to complete reboot..."
+            
+        - name: Start checking host availability
+          block:
+            - name: Wait for host to respond to ping
+              shell: |
+                END_TIME=$(($(date +%s) + {{ max_wait_time - initial_wait }}))
+                while [ $(date +%s) -lt $END_TIME ]; do
+                  if ping -c 1 -W 2 {{ ansible_host }} > /dev/null 2>&1; then
+                    echo "Host is responding to ping"
+                    exit 0
+                  fi
+                  echo "Waiting for ping response..."
+                  sleep {{ ping_interval }}
+                done
+                echo "Timeout waiting for ping"
+                exit 1
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+              register: ping_check
+              
+        - name: Wait for SSH to be available
+          wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            state: started
+            delay: 10
+            timeout: 300
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+            
+        - name: Wait for SSH to be fully ready
+          wait_for_connection:
+            timeout: 300
+            delay: 10
+            
+    - name: Post-reboot tasks
+      block:
+        - name: Calculate downtime
+          set_fact:
+            downtime_seconds: "{{ (now().strftime('%s') | int) - (reboot_start_time | int) }}"
+            
+        - name: Get post-reboot build version
+          raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+          register: post_reboot_build
+          retries: 3
+          delay: 10
+          until: post_reboot_build.rc == 0
+          
+        - name: Verify patch was applied
+          set_fact:
+            patch_applied: "{{ post_reboot_build.stdout | trim == target_build }}"
+            
+        - name: Display patch verification
+          debug:
+            msg:
+              - "Pre-reboot build: {{ pre_reboot_build.stdout | trim }}"
+              - "Post-reboot build: {{ post_reboot_build.stdout | trim }}"
+              - "Target build: {{ target_build }}"
+              - "Patch applied: {{ 'YES ✓' if patch_applied else 'NO ✗' }}"
+              
     - name: Exit maintenance mode
-      raw: esxcli system maintenanceMode set --enable false
-      
-    - name: Send maintenance mode exit event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Host Exited Maintenance Mode"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_reboot"
-            action: "maintenance_mode_disabled"
-            severity: "INFO"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Get post-reboot build
-      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
-      register: post_reboot_build
-      
-    - name: Verify patch application
-      set_fact:
-        patch_applied: "{{ post_reboot_build.stdout | trim == target_build }}"
-        phase2_duration: "{{ (now().strftime('%s') | int) - (phase2_start_time | int) }}"
-        
-    - name: Send Phase 2 completion metrics to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "text/plain; charset=utf-8"
-        body: |
-          esxi.patch.phase2.success,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ now().strftime('%s') }}
-          esxi.patch.phase2.downtime_seconds,host={{ inventory_hostname }} {{ downtime_seconds }} {{ now().strftime('%s') }}
-          esxi.patch.phase2.total_duration_seconds,host={{ inventory_hostname }} {{ phase2_duration }} {{ now().strftime('%s') }}
-          esxi.patch.current_build,host={{ inventory_hostname }} {{ post_reboot_build.stdout | trim }} {{ now().strftime('%s') }}
-        status_code: [200, 201, 202, 204]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Send Phase 2 completion event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_INFO"
-          title: "ESXi Patching {{ 'Completed Successfully' if patch_applied else 'Failed' }}"
-          properties:
-            host: "{{ inventory_hostname }}"
-            phase: "phase2_complete"
-            status: "{{ 'success' if patch_applied else 'failed' }}"
-            pre_build: "{{ pre_reboot_build.stdout | trim }}"
-            post_build: "{{ post_reboot_build.stdout | trim }}"
-            target_build: "{{ target_build }}"
-            downtime_seconds: "{{ downtime_seconds }}"
-            total_duration_seconds: "{{ phase2_duration }}"
-            severity: "{{ 'INFO' if patch_applied else 'ERROR' }}"
-        status_code: [200, 201, 202]
-      delegate_to: localhost
-      vars:
-        ansible_connection: local
-      
-    - name: Display final status
-      debug:
-        msg:
-          - "========================================="
-          - "Patch Status: {{ 'SUCCESS' if patch_applied else 'FAILED' }}"
-          - "New Build: {{ post_reboot_build.stdout | trim }}"
-          - "Downtime: {{ downtime_seconds }} seconds"
-          - "========================================="
+      block:
+        - name: Exit maintenance mode
+          raw: |
+            MM_STATUS=$(esxcli system maintenanceMode get)
+            if echo "$MM_STATUS" | grep -q "Enabled"; then
+              echo "Exiting maintenance mode..."
+              esxcli system maintenanceMode set --enable false
+              echo "Maintenance mode disabled"
+            else
+              echo "Already out of maintenance mode"
+            fi
+          register: mm_exit
+          
+    - name: VM Management - Power On
+      block:
+        - name: Check for saved VM state file
+          raw: |
+            echo "Checking for saved VM state..."
+            if [ -f /vmfs/volumes/datastore1/powered_vms_state.txt ]; then
+              echo "Found saved VM state file"
+              cat /vmfs/volumes/datastore1/powered_vms_state.txt
+              echo "STATE_FILE_EXISTS:YES"
+            else
+              echo "No saved VM state file found"
+              echo "STATE_FILE_EXISTS:NO"
+            fi
+          register: vm_state_check
+          
+        - name: Read VM list from persistent storage if available
+          raw: |
+            # Try to read from persistent file first
+            if [ -f /vmfs/volumes/datastore1/powered_vms_state.txt ]; then
+              VM_IDS=$(cat /vmfs/volumes/datastore1/powered_vms_state.txt | cut -d: -f1 | tr '\n' ' ')
+              echo "Using saved VM list: $VM_IDS"
+            else
+              # Fall back to variable if file doesn't exist
+              VM_IDS="{{ powered_on_vms | join(' ') if powered_on_vms is defined else '' }}"
+              echo "Using variable VM list: $VM_IDS"
+            fi
+            echo "RESTORE_VMS:$VM_IDS"
+          register: vm_restore_list
+          
+        - name: Power on previously running VMs
+          raw: |
+            echo "Powering on VMs..."
+            # Extract VM IDs from the restore list
+            VM_IDS=$(echo "{{ vm_restore_list.stdout }}" | grep "RESTORE_VMS:" | cut -d: -f2)
+            
+            if [ ! -z "$VM_IDS" ]; then
+              SUCCESS=0
+              FAILED=0
+              for VMID in $VM_IDS; do
+                # Get VM name if possible
+                NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2 || echo "Unknown")
+                echo "Starting VM: $NAME (ID: $VMID)"
+                if vim-cmd vmsvc/power.on $VMID 2>/dev/null; then
+                  SUCCESS=$((SUCCESS + 1))
+                  echo "  ✓ Started successfully"
+                else
+                  FAILED=$((FAILED + 1))
+                  echo "  ✗ Failed to start"
+                fi
+              done
+              echo "SUMMARY: Started $SUCCESS VMs, Failed $FAILED"
+              
+              # Clean up state file after successful restore
+              if [ -f /vmfs/volumes/datastore1/powered_vms_state.txt ]; then
+                echo "Cleaning up state file..."
+                mv /vmfs/volumes/datastore1/powered_vms_state.txt /vmfs/volumes/datastore1/powered_vms_state_$(date +%Y%m%d_%H%M%S).bak
+              fi
+            else
+              echo "No VMs to power on"
+            fi
+          register: vm_poweron
+          
+        - name: Verify VMs are running
+          raw: |
+            echo "Verifying VM status..."
+            # Extract VM IDs again
+            VM_IDS=$(echo "{{ vm_restore_list.stdout }}" | grep "RESTORE_VMS:" | cut -d: -f2)
+            
+            if [ ! -z "$VM_IDS" ]; then
+              sleep 30  # Give VMs time to start
+              RUNNING=0
+              STOPPED=0
+              echo "=== VM Status Report ==="
+              for VMID in $VM_IDS; do
+                STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+                NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2 || echo "Unknown")
+                if echo "$STATE" | grep -q "Powered on"; then
+                  echo "✓ VM $NAME (ID: $VMID) is running"
+                  RUNNING=$((RUNNING + 1))
+                else
+                  echo "✗ VM $NAME (ID: $VMID) is not running"
+                  STOPPED=$((STOPPED + 1))
+                fi
+              done
+              echo "========================"
+              echo "VM STATUS SUMMARY: $RUNNING running, $STOPPED stopped"
+            fi
+          register: vm_status
+          
+    - name: Final reporting
+      block:
+        - name: Calculate total duration
+          set_fact:
+            phase2_duration: "{{ (now().strftime('%s') | int) - (phase2_start_time | int) }}"
+            
+        - name: Send completion metrics to Dynatrace
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "text/plain; charset=utf-8"
+            body: |
+              esxi.patch.phase2.success,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ now().strftime('%s') }}
+              esxi.patch.phase2.downtime,host={{ inventory_hostname }} {{ downtime_seconds }} {{ now().strftime('%s') }}
+              esxi.patch.phase2.duration,host={{ inventory_hostname }} {{ phase2_duration }} {{ now().strftime('%s') }}
+              esxi.patch.phase2.vm_count,host={{ inventory_hostname }} {{ powered_on_vms | length }} {{ now().strftime('%s') }}
+            status_code: [200, 201, 202, 204]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          
+        - name: Display final results
+          debug:
+            msg:
+              - "========================================"
+              - "PHASE 2 COMPLETE"
+              - "========================================"
+              - "Patch Status: {{ 'SUCCESS ✓' if patch_applied else 'FAILED ✗' }}"
+              - "Build: {{ pre_reboot_build.stdout | trim }} → {{ post_reboot_build.stdout | trim }}"
+              - "Target: {{ target_build }}"
+              - "Downtime: {{ downtime_seconds }} seconds"
+              - "Total Duration: {{ phase2_duration }} seconds"
+              - "VMs Managed: {{ powered_on_vms | length }}"
+              - "========================================"
+              
+        - name: Fail if patch not applied
+          fail:
+            msg: "Patch not applied! Current build {{ post_reboot_build.stdout | trim }} != {{ target_build }}"
+          when: not patch_applied
