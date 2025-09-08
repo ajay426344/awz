@@ -286,3 +286,7 @@
               - ""
               - "4. Reboot when ready:"
               - "   reboot"
+              
+        - name: Fail the playbook
+          fail:
+            msg: "Phase 1 patching failed. See manual instructions above."
