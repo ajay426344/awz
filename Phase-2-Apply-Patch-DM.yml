@@ -16,6 +16,20 @@
     vm_state_file: "/tmp/vm_state.txt"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+  
+  pre_tasks:
+    - name: Set target host IP for all operations
+      set_fact:
+        target_host_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        
+    - name: Display configuration
+      debug:
+        msg:
+          - "==================================="
+          - "Host: {{ inventory_hostname }}"
+          - "IP Address: {{ target_host_ip }}"
+          - "Target Build: {{ target_build }}"
+          - "==================================="
     
   tasks:
     - name: Phase 2 initialization
@@ -38,6 +52,7 @@
               properties:
                 host: "{{ inventory_hostname }}"
                 phase: "phase2_start"
+                target_ip: "{{ target_host_ip }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
           vars:
@@ -209,7 +224,7 @@
           
         - name: Wait for host to go offline
           wait_for:
-            host: "{{ esxi_host_ip }}"
+            host: "{{ target_host_ip }}"
             port: 22
             state: stopped
             timeout: 120
@@ -227,8 +242,19 @@
             
         - name: Start checking host availability
           block:
-            - name: Wait for host to respond to ping
-              shell: ping -c 1 -W 2 {{ ansible_host }} > /dev/null 2>&1
+            - name: Debug - Show target for ping
+              debug:
+                msg: "Will ping: {{ target_host_ip }}"
+              delegate_to: localhost
+                
+            - name: Wait for host to respond to ping (verbose)
+              shell: |
+                TARGET="{{ target_host_ip }}"
+                echo "Pinging: $TARGET"
+                ping -c 1 -W 2 $TARGET
+                RESULT=$?
+                echo "Exit code: $RESULT"
+                exit $RESULT
               delegate_to: localhost
               vars:
                 ansible_connection: local
@@ -240,7 +266,7 @@
               
         - name: Wait for SSH to be available
           wait_for:
-            host: "{{ ansible_host }}"
+            host: "{{ target_host_ip }}"
             port: 22
             state: started
             delay: 10
@@ -422,6 +448,7 @@
               - "Downtime: {{ downtime_seconds }} seconds"
               - "Total Duration: {{ phase2_duration }} seconds"
               - "VMs Managed: {{ powered_on_vms | length }}"
+              - "Host IP: {{ target_host_ip }}"
               - "========================================"
               
         - name: Fail if patch not applied
