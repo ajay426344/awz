@@ -1,0 +1,219 @@
+---
+# precheck.yml
+# Purpose: Pre-check stage for ESXi hosts (API, SSH, datastore, VMs).
+# AWX usage: map esxi_api_user/esxi_api_pass/ssh_user/ssh_pass/dynatrace_* as credentials or extra_vars.
+
+- name: Precheck - Start temporary SSH on ESXi hosts (via API)
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.vmware
+  vars:
+    ssh_service_name: "TSM-SSH"
+    ssh_enable_timeout: 600
+  tasks:
+    - name: Start SSH service on each ESXi via API
+      vmware_host_service_manager:
+        hostname: "{{ item }}"
+        username: "{{ esxi_api_user }}"
+        password: "{{ esxi_api_pass }}"
+        validate_certs: "{{ validate_certs | default(false) }}"
+        service: "{{ ssh_service_name }}"
+        state: started
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      register: ssh_start_results
+      retries: 3
+      delay: 5
+      until: ssh_start_results is succeeded
+
+    - name: Wait for SSH reachable on each ESXi (control plane)
+      wait_for:
+        host: "{{ item }}"
+        port: 22
+        state: started
+        timeout: "{{ ssh_enable_timeout }}"
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      delegate_to: localhost
+
+- name: Precheck - Run checks on ESXi hosts
+  hosts: esxi_hosts
+  gather_facts: no
+  serial: 10
+  vars:
+    datastore_candidates: "/vmfs/volumes/datastore*"
+    min_free_gb: "{{ min_free_gb | default(3) }}"
+    vm_state_file: "/tmp/esxi_vm_state_{{ inventory_hostname }}.txt"
+  tasks:
+    - name: Set precheck timestamp
+      set_fact:
+        precheck_ts: "{{ now().strftime('%s') }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Verify SSH connectivity from control to host
+      wait_for_connection:
+        timeout: 30
+      register: ssh_ok
+
+    - name: Check ESXi API (hostd) connectivity (control plane)
+      community.vmware.vmware_host_facts:
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ esxi_api_user }}"
+        password: "{{ esxi_api_pass }}"
+        validate_certs: "{{ validate_certs | default(false) }}"
+      register: host_facts
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Get ESXi build/version (remote)
+      raw: vmware -v || true
+      register: vmware_ver
+      changed_when: false
+
+    - name: List datastores and free space, pick best candidate
+      raw: |
+        # list VMFS/NFS datastores and free bytes
+        for DS in /vmfs/volumes/*; do
+          if [ -d "$DS" ]; then
+            name=$(basename "$DS")
+            free_bytes=$(df --output=avail -B1 "$DS" 2>/dev/null | tail -1 || echo 0)
+            echo "$name:$free_bytes"
+          fi
+        done | sort -t: -k2 -rn
+      register: ds_list
+      changed_when: false
+
+    - name: Choose datastore with enough free space
+      set_fact:
+        selected_datastore: >-
+          {{
+            (ds_list.stdout_lines | map('split', ':') | selectattr('1','defined') |
+             map('first','*') | list) | default([])
+          }}
+      # We'll parse next task for actual selection
+
+    - name: Parse best datastore (prefer >= min_free_gb)
+      set_fact:
+        best_datastore: >-
+          {{
+            (
+              ds_list.stdout_lines | map('split', ':') |
+              selectattr('1','defined') |
+              map('map','trim') |
+              map('first','*') | list
+            )
+          }}
+      # The above is placeholder -- we set final selection with a shell parsing below
+
+    - name: Determine best datastore (shell parsing for accuracy)
+      raw: |
+        MIN_BYTES=$(( {{ min_free_gb | int }} * 1073741824 ))
+        BEST=""
+        BEST_FREE=0
+        for LINE in $(for d in /vmfs/volumes/*; do if [ -d "$d" ]; then name=$(basename "$d"); free=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0); echo "$name:$free"; fi; done); do
+          NAME=$(echo $LINE | cut -d: -f1)
+          FREE=$(echo $LINE | cut -d: -f2)
+          if [ $FREE -ge $MIN_BYTES ] && [ $FREE -gt $BEST_FREE ]; then
+            BEST="$NAME"
+            BEST_FREE=$FREE
+          fi
+        done
+        # fallback: pick largest if none meets MIN
+        if [ -z "$BEST" ]; then
+          for LINE in $(for d in /vmfs/volumes/*; do if [ -d "$d" ]; then name=$(basename "$d"); free=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0); echo "$name:$free"; fi; done); do
+            NAME=$(echo $LINE | cut -d: -f1)
+            FREE=$(echo $LINE | cut -d: -f2)
+            if [ $FREE -gt $BEST_FREE ]; then
+              BEST="$NAME"
+              BEST_FREE=$FREE
+            fi
+          done
+        fi
+        echo "${BEST}:${BEST_FREE}"
+      register: ds_choice
+      changed_when: false
+
+    - name: Set datastore facts
+      set_fact:
+        selected_datastore: "{{ ds_choice.stdout.split(':')[0] | default('') }}"
+        selected_datastore_free_bytes: "{{ ds_choice.stdout.split(':')[1] | default('0') }}"
+        selected_datastore_free_gb: "{{ (ds_choice.stdout.split(':')[1] | default('0') | int) / 1073741824 | float | round(2) }}"
+
+    - name: Count powered-on VMs
+      raw: |
+        COUNT=0
+        for VMID in $(vim-cmd vmsvc/getallvms | tail -n +2 | awk '{print $1}'); do
+          STATE=$(vim-cmd vmsvc/power.getstate $VMID | tail -1)
+          if echo "$STATE" | grep -q "Powered on"; then COUNT=$((COUNT+1)); fi
+        done
+        echo "$COUNT"
+      register: powered_on_count
+      changed_when: false
+
+    - name: Decide precheck result
+      set_fact:
+        api_status: "{{ 1 if host_facts is defined and host_facts.connected | default(false) else 0 }}"
+        ssh_status: "{{ 'PASS' if ssh_ok is success else 'FAIL' }}"
+        precheck_passed: "{{ (api_status == 1) and (ssh_status == 'PASS') and (selected_datastore_free_gb | float >= min_free_gb) }}"
+
+    - name: Send precheck metrics to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.patch.precheck.api_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ api_status }} {{ precheck_ts }}
+          esxi.patch.precheck.ssh_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if ssh_status == 'PASS' else 0 }} {{ precheck_ts }}
+          esxi.patch.precheck.available_space_gb,host={{ inventory_hostname }},job_id={{ job_id }} {{ selected_datastore_free_gb }} {{ precheck_ts }}
+          esxi.patch.precheck.powered_on_vms,host={{ inventory_hostname }},job_id={{ job_id }} {{ powered_on_count.stdout | int }} {{ precheck_ts }}
+          esxi.patch.precheck.build_string,host={{ inventory_hostname }},job_id={{ job_id }} 0 {{ precheck_ts }}
+        status_code: [200,201,202,204]
+      delegate_to: localhost
+      when: dynatrace_url is defined and dynatrace_token is defined
+
+    - name: Send precheck event to Dynatrace
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/events/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          eventType: "CUSTOM_ANNOTATION"
+          title: "ESXi Pre-check {{ 'Passed' if precheck_passed else 'Failed' }} - {{ inventory_hostname }}"
+          properties:
+            host: "{{ inventory_hostname }}"
+            stage: "precheck"
+            job_id: "{{ job_id }}"
+            api_status: "{{ api_status }}"
+            ssh_status: "{{ ssh_status }}"
+            selected_datastore: "{{ selected_datastore }}"
+            selected_datastore_free_gb: "{{ selected_datastore_free_gb }}"
+            powered_on_vms: "{{ powered_on_count.stdout | int }}"
+            vmware_version: "{{ vmware_ver.stdout | default('') }}"
+        status_code: [200,201,202]
+      delegate_to: localhost
+      when: dynatrace_url is defined and dynatrace_token is defined
+
+- name: Precheck - Ensure SSH stopped on ESXi hosts (cleanup)
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.vmware
+  tasks:
+    - name: Stop SSH on each ESXi via API (cleanup)
+      vmware_host_service_manager:
+        hostname: "{{ item }}"
+        username: "{{ esxi_api_user }}"
+        password: "{{ esxi_api_pass }}"
+        validate_certs: "{{ validate_certs | default(false) }}"
+        service: "{{ ssh_service_name }}"
+        state: stopped
+      loop: "{{ groups['esxi_hosts'] | default([]) }}"
+      register: ssh_stop
+      retries: 3
+      delay: 5
+      until: ssh_stop is succeeded
