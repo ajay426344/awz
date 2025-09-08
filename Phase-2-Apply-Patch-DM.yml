@@ -209,7 +209,7 @@
           
         - name: Wait for host to go offline
           wait_for:
-            host: "{{ ansible_host }}"
+            host: "{{ esxi_host_ip }}"
             port: 22
             state: stopped
             timeout: 120
