@@ -15,7 +15,7 @@
     vm_shutdown_timeout: 300  # 5 minutes for VM shutdown
     vm_state_file: "/tmp/vm_state.txt"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
-    dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
+    dynatrace_token: " {{ dynatrace_api_token }} "
   
   pre_tasks:
     - name: Set target host IP for all operations
