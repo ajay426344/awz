@@ -13,9 +13,9 @@
     ping_interval: 30   # Check every 30 seconds
     max_wait_time: 900  # 15 minutes total timeout
     vm_shutdown_timeout: 300  # 5 minutes for VM shutdown
+    vm_state_file: "/tmp/vm_state.txt"
     dynatrace_url: "https://ofp39563.live.dynatrace.com"
     dynatrace_token: "dt0c01.MOQDVGYZV5NLQAAUFJMYVXM4.PNI42OD4D5V33H6IV4HQKJGB2VFDGJTPV3D6TKJBTMQ35JD62QIDNUM3OJKGQMVJ"
-    vm_state_file: "/tmp/vm_state.txt"  # Added missing variable
     
   tasks:
     - name: Phase 2 initialization
@@ -75,7 +75,7 @@
           set_fact:
             powered_on_vms: "{{ (vm_list.stdout | regex_search('POWERED_ON_VMS:(.*)$', '\\1') | first).split() if vm_list.stdout is search('POWERED_ON_VMS:') else [] }}"
             
-        - name: Save VM state to file for post-reboot restoration
+        - name: Save VM state to file
           raw: |
             STATE_FILE="{{ vm_state_file }}"
             VM_IDS="{{ powered_on_vms | join(' ') }}"
@@ -179,14 +179,6 @@
           set_fact:
             reboot_start_time: "{{ now().strftime('%s') }}"
             
-        - name: Verify maintenance mode before reboot
-          raw: esxcli system maintenanceMode get
-          register: mm_check_before_reboot
-          
-        - name: Display maintenance mode status
-          debug:
-            msg: "Maintenance mode status: {{ mm_check_before_reboot.stdout | trim }}"
-            
         - name: Send reboot event to Dynatrace
           uri:
             url: "{{ dynatrace_url }}/api/v2/events/ingest"
@@ -201,48 +193,19 @@
               properties:
                 host: "{{ inventory_hostname }}"
                 action: "reboot_initiated"
-                pre_reboot_build: "{{ pre_reboot_build.stdout | trim }}"
             status_code: [200, 201, 202]
           delegate_to: localhost
           vars:
             ansible_connection: local
           ignore_errors: yes
             
-        # FIXED REBOOT SECTION - Using ESXi native commands
-        - name: Issue reboot command using ESXi native method
-          raw: |
-            echo "Initiating ESXi system reboot..."
-            # Use ESXi's native shutdown command with reboot flag
-            REASON="Applying patch build {{ target_build }}"
-            esxcli system shutdown reboot --delay=10 --reason="${REASON}"
-            echo "Reboot command issued successfully"
-          register: reboot_cmd
+        - name: Issue reboot command
+          raw: esxcli system shutdown reboot --delay=10 --reason=Patching
           async: 1
           poll: 0
           ignore_errors: yes
           
-        # Fallback reboot method if ESXi command fails
-        - name: Alternative reboot method (fallback)
-          raw: |
-            # Check if reboot is already scheduled
-            if ! ps | grep -v grep | grep -q "shutdown"; then
-              echo "Using alternative reboot method..."
-              # Direct reboot command
-              /sbin/reboot -f -d 10
-              echo "Alternative reboot command issued"
-            else
-              echo "Reboot already in progress"
-            fi
-          when: reboot_cmd is failed
-          async: 1
-          poll: 0
-          ignore_errors: yes
-          
-        - name: Brief pause to ensure reboot command is processed
-          pause:
-            seconds: 5
-            
-        - name: Verify host is going offline
+        - name: Wait for host to go offline
           wait_for:
             host: "{{ ansible_host }}"
             port: 22
