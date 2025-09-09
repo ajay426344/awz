@@ -1,130 +1,325 @@
 ---
-# phase1.yml
-# Purpose: Phase 1 - select datastore, ensure patch is on host datastore (host pulls), dry-run and stage (no-live-install)
-# Requires: patch_file, patch_profile, http_server_url, min_free_gb (optional)
+# stage2_staging.yml
+# Stage 2: ESXi Patch Staging - Download and Stage Patches
+# This stage downloads patches and prepares them for installation
 
-- name: Phase1 - Start temporary SSH on ESXi hosts (via API)
-  hosts: localhost
-  gather_facts: false
-  collections:
-    - community.vmware
-  vars:
-    ssh_service_name: "TSM-SSH"
-    ssh_enable_timeout: 600
-  tasks:
-    - name: Start SSH service on each ESXi via API
-      vmware_host_service_manager:
-        hostname: "{{ item }}"
-        username: "{{ esxi_api_user }}"
-        password: "{{ esxi_api_pass }}"
-        validate_certs: "{{ validate_certs | default(false) }}"
-        service: "{{ ssh_service_name }}"
-        state: started
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      register: ssh_start
-      retries: 3
-      delay: 5
-      until: ssh_start is succeeded
-
-    - name: Wait for SSH reachable for each ESXi
-      wait_for:
-        host: "{{ item }}"
-        port: 22
-        state: started
-        timeout: "{{ ssh_enable_timeout }}"
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      delegate_to: localhost
-
-- name: Phase1 - select datastore, download patch if needed, dry-run & stage (on hosts)
-  hosts: esxi_hosts
+- name: "Stage 2: ESXi Patch Staging"
+  hosts: all
   gather_facts: no
   serial: 1
+  
   vars:
-    patch_dir_template: "/vmfs/volumes/{{ datastore }}/patches"
-    patch_path_template: "/vmfs/volumes/{{ datastore }}/patches/{{ patch_file }}"
-    min_free_gb: "{{ min_free_gb | default(3) }}"
-    min_valid_size: 900000000   # bytes threshold for a valid patch file (adjust if needed)
+    # Host Configuration
+    target_host: "{{ ansible_host | default(inventory_hostname) }}"
+    ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    ansible_user: "root"
+    ansible_password: "{{ vault_esxi_password | default('Ajay@426344') }}"
+    
+    # SSH Management
+    enable_ssh_automatically: "{{ auto_ssh | default(true) }}"
+    
+    # Patch Configuration
+    patch_file: "{{ esxi_patch_file | default('VMware-ESXi-8.0U3g-24859861-depot.zip') }}"
+    patch_profile: "{{ esxi_patch_profile | default('ESXi-8.0U3g-24859861-standard') }}"
+    target_build: "{{ esxi_target_build | default('24859861') }}"
+    http_server_url: "{{ patch_server_url | default('http://192.168.0.110') }}"
+    
+    # Use datastore from Stage 1
+    selected_datastore: "{{ hostvars[inventory_hostname]['selected_datastore'] | default('/vmfs/volumes/datastore1') }}"
+    
+    # Dynatrace Monitoring
+    dynatrace_enabled: "{{ enable_dynatrace | default(true) }}"
+    dynatrace_url: "{{ dt_url | default('https://ofp39563.live.dynatrace.com') }}"
+    dynatrace_token: "{{ dt_api_token }}"
+    
   tasks:
-    - name: Find best datastore (pick largest with >= min_free_gb else largest overall)
-      raw: |
-        MIN_BYTES=$(( {{ min_free_gb | int }} * 1073741824 ))
-        BEST=""
-        BEST_FREE=0
-        for d in /vmfs/volumes/*; do
-          if [ -d "$d" ]; then
-            NAME=$(basename "$d")
-            FREE=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0)
-            if [ $FREE -ge $MIN_BYTES ] && [ $FREE -gt $BEST_FREE ]; then
-              BEST="$NAME"
-              BEST_FREE=$FREE
-            fi
-          fi
-        done
-        if [ -z "$BEST" ]; then
-          for d in /vmfs/volumes/*; do
-            if [ -d "$d" ]; then
-              NAME=$(basename "$d")
-              FREE=$(df --output=avail -B1 "$d" 2>/dev/null | tail -1 || echo 0)
-              if [ $FREE -gt $BEST_FREE ]; then
-                BEST="$NAME"
-                BEST_FREE=$FREE
-              fi
-            fi
-          done
-        fi
-        echo "${BEST}:${BEST_FREE}"
-      register: datastore_choice
-      changed_when: false
-
-    - name: Set selected datastore & paths
+    # =========================================================================
+    # SECTION 1: ENABLE SSH IF NEEDED
+    # =========================================================================
+    - name: "1.1: Enable SSH if Not Already Enabled"
+      when: enable_ssh_automatically | bool
+      block:
+        - name: Check if SSH is already enabled
+          wait_for:
+            host: "{{ target_host }}"
+            port: 22
+            state: started
+            timeout: 5
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          register: ssh_check
+          ignore_errors: yes
+          
+        - name: Enable SSH via SOAP API if needed
+          when: ssh_check is failed
+          block:
+            - name: Login to ESXi SOAP API
+              uri:
+                url: "https://{{ target_host }}/sdk"
+                method: POST
+                validate_certs: no
+                force_basic_auth: yes
+                user: "{{ ansible_user }}"
+                password: "{{ ansible_password }}"
+                headers:
+                  Content-Type: "text/xml; charset=utf-8"
+                body: |
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                    xmlns:vim="urn:vim25">
+                    <soapenv:Body>
+                      <vim:Login>
+                        <vim:_this type="SessionManager">ha-sessionmgr</vim:_this>
+                        <vim:userName>{{ ansible_user }}</vim:userName>
+                        <vim:password>{{ ansible_password }}</vim:password>
+                      </vim:Login>
+                    </soapenv:Body>
+                  </soapenv:Envelope>
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+              register: soap_login
+              
+            - name: Start SSH service
+              uri:
+                url: "https://{{ target_host }}/sdk"
+                method: POST
+                validate_certs: no
+                headers:
+                  Content-Type: "text/xml; charset=utf-8"
+                  Cookie: "vmware_soap_session={{ soap_login.cookies['vmware_soap_session'] }}"
+                body: |
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                    xmlns:vim="urn:vim25">
+                    <soapenv:Body>
+                      <vim:StartService>
+                        <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
+                        <vim:id>TSM-SSH</vim:id>
+                      </vim:StartService>
+                    </soapenv:Body>
+                  </soapenv:Envelope>
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+                
+            - name: Wait for SSH
+              wait_for:
+                host: "{{ target_host }}"
+                port: 22
+                state: started
+                delay: 5
+                timeout: 60
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+                
+            - name: Mark SSH as auto-enabled
+              set_fact:
+                ssh_auto_enabled_stage2: true
+                
+    # =========================================================================
+    # SECTION 2: VERIFY PREREQUISITES
+    # =========================================================================
+    - name: "2.1: Initialize Staging"
       set_fact:
-        selected_datastore: "{{ datastore_choice.stdout.split(':')[0] | default('') }}"
-        selected_datastore_free_bytes: "{{ datastore_choice.stdout.split(':')[1] | default('0') }}"
-        selected_datastore_free_gb: "{{ (datastore_choice.stdout.split(':')[1] | default('0') | int) / 1073741824 | float | round(2) }}"
-        patch_dir: "/vmfs/volumes/{{ selected_datastore }}/patches"
-        patch_path: "/vmfs/volumes/{{ selected_datastore }}/patches/{{ patch_file }}"
-
-    - name: Ensure patch directory exists on selected datastore
-      raw: mkdir -p "{{ patch_dir }}" && ls -ld "{{ patch_dir }}"
-      register: mkdir_out
-
-    - name: Check for existing patch file and size
+        staging_timestamp: "{{ now().strftime('%s') }}"
+        staging_date: "{{ now().isoformat() }}"
+        patch_directory: "{{ selected_datastore }}/patches"
+        patch_full_path: "{{ selected_datastore }}/patches/{{ patch_file }}"
+        
+    - name: "2.2: Verify Current Build"
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: current_build
+      
+    - name: "2.3: Check if Patching Needed"
+      set_fact:
+        needs_patching: "{{ (current_build.stdout | trim | int) < (target_build | int) }}"
+        
+    - name: "2.4: Skip if Already Patched"
+      when: not needs_patching
+      debug:
+        msg:
+          - "Host {{ inventory_hostname }} is already at build {{ current_build.stdout | trim }}"
+          - "Target build {{ target_build }} - No patching needed"
+          
+    - name: "2.5: End Play if No Patching Needed"
+      meta: end_play
+      when: not needs_patching
+      
+    # =========================================================================
+    # SECTION 3: PREPARE STAGING ENVIRONMENT
+    # =========================================================================
+    - name: "3.1: Create Patches Directory"
       raw: |
-        if [ -f "{{ patch_path }}" ]; then
-          stat -c '%s' "{{ patch_path }}"
+        if [ ! -d "{{ patch_directory }}" ]; then
+          mkdir -p "{{ patch_directory }}"
+          echo "CREATED"
         else
-          echo 0
+          echo "EXISTS"
         fi
-      register: patch_size
-      changed_when: false
-
-    - name: Download patch to datastore from HTTP server if missing or too small
+      register: dir_creation
+      
+    - name: "3.2: Check Existing Patch File"
       raw: |
-        cd "{{ patch_dir }}"
-        wget -O "{{ patch_file }}.tmp" "{{ http_server_url }}/{{ patch_file }}" && mv "{{ patch_file }}.tmp" "{{ patch_file }}"
-      register: download
-      retries: 3
-      delay: 30
-      until: download.rc == 0
-      when: patch_size.stdout | int < min_valid_size
-
-    - name: Compute patch checksum (sha256)
-      raw: |
-        if [ -f "{{ patch_path }}" ]; then
-          sha256sum "{{ patch_path }}" | awk '{print $1}'
+        if [ -f "{{ patch_full_path }}" ]; then
+          SIZE=$(ls -l "{{ patch_full_path }}" 2>/dev/null | awk '{print $5}')
+          MD5=$(md5sum "{{ patch_full_path }}" 2>/dev/null | awk '{print $1}')
+          
+          # Check if file is at least 600MB (typical patch size)
+          if [ "$SIZE" -gt 600000000 ]; then
+            echo "EXISTS_VALID:${SIZE}:${MD5}"
+          else
+            rm -f "{{ patch_full_path }}"
+            echo "EXISTS_INVALID:${SIZE}:removed"
+          fi
         else
-          echo ""
+          echo "NOT_EXISTS:0:none"
         fi
-      register: patch_checksum
-      changed_when: false
-
-    - name: Dry-run (verify compatibility) using esxcli
+      register: patch_status
+      
+    - name: "3.3: Parse Patch Status"
+      set_fact:
+        patch_exists: "{{ 'EXISTS_VALID' in patch_status.stdout }}"
+        patch_size: "{{ patch_status.stdout.split(':')[1] if ':' in patch_status.stdout else '0' }}"
+        patch_md5: "{{ patch_status.stdout.split(':')[2] if ':' in patch_status.stdout else 'none' }}"
+        
+    # =========================================================================
+    # SECTION 4: DOWNLOAD PATCH IF NEEDED
+    # =========================================================================
+    - name: "4.1: Download Patch"
+      when: not patch_exists
+      block:
+        - name: Enable HTTP Client firewall rule
+          raw: |
+            esxcli network firewall ruleset set -e true -r httpClient
+            echo "HTTP_CLIENT_ENABLED"
+          register: firewall_rule
+          
+        - name: Display download information
+          debug:
+            msg:
+              - "Downloading patch from: {{ http_server_url }}/{{ patch_file }}"
+              - "Destination: {{ patch_full_path }}"
+              
+        - name: Download patch file
+          raw: |
+            cd "{{ patch_directory }}"
+            
+            # Remove any partial downloads
+            rm -f "{{ patch_file }}.tmp" 2>/dev/null
+            
+            # Download with progress tracking
+            echo "Starting download..."
+            wget --progress=dot:giga \
+                 --tries=3 \
+                 --timeout=300 \
+                 -O "{{ patch_file }}.tmp" \
+                 "{{ http_server_url }}/{{ patch_file }}" 2>&1 | \
+                 grep -E "%.+\[" | tail -5
+            
+            if [ $? -eq 0 ] && [ -f "{{ patch_file }}.tmp" ]; then
+              # Verify downloaded file size
+              SIZE=$(ls -l "{{ patch_file }}.tmp" | awk '{print $5}')
+              if [ "$SIZE" -gt 600000000 ]; then
+                mv "{{ patch_file }}.tmp" "{{ patch_file }}"
+                echo "DOWNLOAD_SUCCESS:${SIZE}"
+              else
+                rm -f "{{ patch_file }}.tmp"
+                echo "DOWNLOAD_FAILED:SIZE_TOO_SMALL:${SIZE}"
+                exit 1
+              fi
+            else
+              echo "DOWNLOAD_FAILED:WGET_ERROR"
+              exit 1
+            fi
+          register: download_result
+          retries: 2
+          delay: 30
+          until: download_result.rc == 0
+          
+        - name: Verify downloaded patch
+          raw: |
+            if [ -f "{{ patch_full_path }}" ]; then
+              SIZE=$(ls -lh "{{ patch_full_path }}" | awk '{print $5}')
+              MD5=$(md5sum "{{ patch_full_path }}" | awk '{print $1}')
+              echo "PATCH_READY:${SIZE}:${MD5}"
+            else
+              echo "PATCH_MISSING"
+              exit 1
+            fi
+          register: patch_verification
+          
+    # =========================================================================
+    # SECTION 5: VALIDATE PATCH
+    # =========================================================================
+    - name: "5.1: Run Patch Dry-Run"
       raw: |
-        esxcli software profile update -d "{{ patch_path }}" -p "{{ patch_profile }}" --dry-run
-      register: dry_run
+        echo "=== Running Patch Validation ==="
+        esxcli software profile update \
+          -d "{{ patch_full_path }}" \
+          -p "{{ patch_profile }}" \
+          --dry-run 2>&1
+        
+        if [ $? -eq 0 ]; then
+          echo "DRY_RUN_SUCCESS"
+        else
+          echo "DRY_RUN_FAILED"
+        fi
+      register: dry_run_result
       ignore_errors: yes
-
-    - name: Send phase1 dryrun metric to Dynatrace
+      
+    - name: "5.2: Parse Dry-Run Results"
+      set_fact:
+        dry_run_passed: "{{ 'DRY_RUN_SUCCESS' in dry_run_result.stdout or 'would be installed' in dry_run_result.stdout }}"
+        dry_run_output: "{{ dry_run_result.stdout_lines | select('match', '.*VIB.*') | list }}"
+        
+    # =========================================================================
+    # SECTION 6: STAGE PATCH (NO LIVE INSTALL)
+    # =========================================================================
+    - name: "6.1: Stage Patch for Next Reboot"
+      when: dry_run_passed
+      raw: |
+        echo "=== Staging Patch for Installation ==="
+        esxcli software profile update \
+          -d "{{ patch_full_path }}" \
+          -p "{{ patch_profile }}" \
+          --no-live-install 2>&1
+        
+        RESULT=$?
+        if [ $RESULT -eq 0 ]; then
+          echo "STAGING_SUCCESS"
+          # List staged VIBs
+          esxcli software vib list | grep -E "{{ target_build }}" | head -5
+        else
+          echo "STAGING_FAILED:EXIT_CODE_${RESULT}"
+        fi
+      register: staging_result
+      
+    - name: "6.2: Verify Staging Success"
+      set_fact:
+        staging_successful: "{{ 'STAGING_SUCCESS' in staging_result.stdout }}"
+        
+    # =========================================================================
+    # SECTION 7: CLEANUP AND REPORTING
+    # =========================================================================
+    - name: "7.1: Disable HTTP Client Firewall Rule"
+      raw: |
+        esxcli network firewall ruleset set -e false -r httpClient
+        echo "HTTP_CLIENT_DISABLED"
+      when: firewall_rule is defined
+      ignore_errors: yes
+      
+    - name: "7.2: Calculate Staging Duration"
+      set_fact:
+        staging_duration: "{{ (now().strftime('%s') | int) - (staging_timestamp | int) }}"
+        
+    - name: "7.3: Send Dynatrace Metrics"
+      when: 
+        - dynatrace_enabled | bool
+        - dynatrace_token is defined
       uri:
         url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
         method: POST
@@ -132,93 +327,53 @@
           Authorization: "Api-Token {{ dynatrace_token }}"
           Content-Type: "text/plain; charset=utf-8"
         body: |
-          esxi.patch.phase1.dryrun_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if dry_run.rc == 0 else 0 }} {{ now().strftime('%s') }}
-          esxi.patch.phase1.selected_datastore_free_gb,host={{ inventory_hostname }},job_id={{ job_id }} {{ selected_datastore_free_gb }} {{ now().strftime('%s') }}
-        status_code: [200,201,202,204]
+          esxi.staging.status,host={{ inventory_hostname }} {{ 1 if staging_successful else 0 }} {{ staging_timestamp }}
+          esxi.staging.duration,host={{ inventory_hostname }} {{ staging_duration }} {{ staging_timestamp }}
+          esxi.staging.patch_size,host={{ inventory_hostname }} {{ patch_size }} {{ staging_timestamp }}
+        status_code: [200, 201, 202, 204]
       delegate_to: localhost
-      when: dynatrace_url is defined and dynatrace_token is defined
-
-    - name: If dry-run failed, emit event and fail
-      block:
-        - name: Emit dry-run failed event
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_ANNOTATION"
-              title: "ESXi Phase1 Dry-run FAILED - {{ inventory_hostname }}"
-              properties:
-                host: "{{ inventory_hostname }}"
-                stage: "phase1"
-                job_id: "{{ job_id }}"
-                dry_run_rc: "{{ dry_run.rc }}"
-                selected_datastore: "{{ selected_datastore }}"
-            status_code: [200,201,202]
-          delegate_to: localhost
-          ignore_errors: yes
-      when: dry_run.rc != 0
-
-    - name: Stage patch (no-live-install) if dry-run succeeded
-      raw: |
-        esxcli software profile update -d "{{ patch_path }}" -p "{{ patch_profile }}" --no-live-install
-      register: stage_out
-      when: dry_run.rc == 0
+      vars:
+        ansible_connection: local
       ignore_errors: yes
-
-    - name: Send staging metrics & event to Dynatrace
-      block:
-        - name: Send metrics
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "text/plain; charset=utf-8"
-            body: |
-              esxi.patch.phase1.staging_status,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if stage_out.rc == 0 else 0 }} {{ now().strftime('%s') }}
-              esxi.patch.phase1.staging_duration_seconds,host={{ inventory_hostname }},job_id={{ job_id }} {{ 0 }} {{ now().strftime('%s') }}
-            status_code: [200,201,202,204]
-          delegate_to: localhost
-        - name: Send event
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_ANNOTATION"
-              title: "ESXi Phase1 Staging {{ 'Succeeded' if stage_out.rc == 0 else 'Failed' }} - {{ inventory_hostname }}"
-              properties:
-                host: "{{ inventory_hostname }}"
-                stage: "phase1"
-                job_id: "{{ job_id }}"
-                stage_rc: "{{ stage_out.rc | default('') }}"
-            status_code: [200,201,202]
-          delegate_to: localhost
-      when: dry_run.rc == 0
-
-- name: Phase1 - Ensure SSH stopped on ESXi hosts (cleanup)
-  hosts: localhost
-  gather_facts: false
-  collections:
-    - community.vmware
-  tasks:
-    - name: Stop SSH service on each ESXi via API
-      vmware_host_service_manager:
-        hostname: "{{ item }}"
-        username: "{{ esxi_api_user }}"
-        password: "{{ esxi_api_pass }}"
-        validate_certs: "{{ validate_certs | default(false) }}"
-        service: "{{ ssh_service_name }}"
-        state: stopped
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      register: ssh_stop
-      retries: 3
-      delay: 5
-      until: ssh_stop is succeeded
+      
+    - name: "7.4: Display Staging Summary"
+      debug:
+        msg:
+          - "============================================================"
+          - "STAGE 2: STAGING SUMMARY"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }} ({{ target_host }})"
+          - "------------------------------------------------------------"
+          - "PATCH DETAILS:"
+          - "  Patch File: {{ patch_file }}"
+          - "  Patch Profile: {{ patch_profile }}"
+          - "  Target Build: {{ target_build }}"
+          - "  Patch Location: {{ patch_full_path }}"
+          - "  Patch Size: {{ patch_size }} bytes"
+          - "  Patch MD5: {{ patch_md5 }}"
+          - "------------------------------------------------------------"
+          - "STAGING RESULTS:"
+          - "  Dry-Run: {{ 'PASSED ✓' if dry_run_passed else 'FAILED ✗' }}"
+          - "  Staging: {{ 'SUCCESS ✓' if staging_successful else 'FAILED ✗' }}"
+          - "  Duration: {{ staging_duration }} seconds"
+          - "------------------------------------------------------------"
+          - "STATUS: {{ 'READY FOR REBOOT' if staging_successful else 'STAGING FAILED' }}"
+          - "============================================================"
+          
+    - name: "7.5: Save Staging Results"
+      set_stats:
+        data:
+          stage2_status: "{{ 'success' if staging_successful else 'failed' }}"
+          patch_staged: "{{ staging_successful }}"
+          patch_location: "{{ patch_full_path }}"
+          staging_duration: "{{ staging_duration }}"
+          dry_run_passed: "{{ dry_run_passed }}"
+          
+    - name: "7.6: Fail if Staging Failed"
+      fail:
+        msg: |
+          Staging FAILED for {{ inventory_hostname }}
+          Check the staging output for details
+      when:
+        - not staging_successful
+        - enforce_staging | default(true) | bool
