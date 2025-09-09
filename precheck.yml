@@ -1,65 +1,65 @@
 ---
-# esxi_precheck.yml
-# ESXi Pre-check Stage with Automated SSH Management for AWX
-# This playbook performs pre-checks only and reports readiness for patching
+# stage1_precheck.yml
+# Stage 1: ESXi Pre-check with Automated SSH Management via SOAP API
+# Requires: ESXi with proper license (vSphere Essentials or higher)
 
-- name: ESXi Pre-check with Automated SSH Management
+- name: "Stage 1: ESXi Pre-check with SSH Automation"
   hosts: all
   gather_facts: no
-  serial: 1  # Process one host at a time
+  serial: 1
+  connection: local  # Start local, switch to SSH after enabling
   
   vars:
     # Host Configuration
     target_host: "{{ ansible_host | default(inventory_hostname) }}"
-    ansible_user: "root"
-    ansible_password: "{{ esxi_password | default('Ajay@426344') }}"
-    ansible_connection: ssh
-    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    esxi_username: "root"
+    esxi_password: "{{ vault_esxi_password | default('Ajay@426344') }}"
     
     # SSH Management
-    manage_ssh_automatically: "{{ enable_auto_ssh | default(true) }}"
-    disable_ssh_after_check: "{{ disable_ssh_post_check | default(true) }}"
+    enable_ssh_automatically: "{{ auto_ssh | default(true) }}"
+    keep_ssh_enabled: "{{ persistent_ssh | default(false) }}"
     
-    # Patch Configuration for Validation
+    # Validation Parameters
     target_build: "{{ esxi_target_build | default('24859861') }}"
-    minimum_space_gb: "{{ min_space_gb | default(3) }}"
+    minimum_space_gb: "{{ min_datastore_space | default(3) }}"
+    patch_file: "{{ esxi_patch_file | default('VMware-ESXi-8.0U3g-24859861-depot.zip') }}"
     
-    # Dynatrace Configuration
+    # Dynatrace Monitoring
+    dynatrace_enabled: "{{ enable_dynatrace | default(true) }}"
     dynatrace_url: "{{ dt_url | default('https://ofp39563.live.dynatrace.com') }}"
-    dynatrace_token: "{{ dt_api_token | default('') }}"
-    enable_dynatrace: "{{ use_dynatrace | default(true) }}"
+    dynatrace_token: "{{ dt_api_token }}"
     
   tasks:
     # =========================================================================
-    # STAGE 1: SSH ENABLEMENT VIA API
+    # SECTION 1: SSH ENABLEMENT
     # =========================================================================
-    - name: "STAGE 1: Enable SSH via API"
-      when: manage_ssh_automatically | bool
+    - name: "1.1: Initialize Pre-check"
+      set_fact:
+        precheck_timestamp: "{{ now().strftime('%s') }}"
+        precheck_date: "{{ now().isoformat() }}"
+        ssh_was_enabled_by_automation: false
+        
+    - name: "1.2: Enable SSH via SOAP API"
+      when: enable_ssh_automatically | bool
       block:
-        - name: Display target information
-          debug:
-            msg:
-              - "Target Host: {{ inventory_hostname }}"
-              - "IP Address: {{ target_host }}"
-              - "SSH Auto-Management: {{ 'Enabled' if manage_ssh_automatically else 'Disabled' }}"
-              
-        - name: Check HTTPS connectivity to ESXi host
+        - name: Check HTTPS connectivity
           wait_for:
             host: "{{ target_host }}"
             port: 443
             state: started
             timeout: 10
           delegate_to: localhost
-          register: https_check
-          
+          vars:
+            ansible_connection: local
+            
         - name: Login to ESXi SOAP API
           uri:
             url: "https://{{ target_host }}/sdk"
             method: POST
             validate_certs: no
             force_basic_auth: yes
-            user: "{{ ansible_user }}"
-            password: "{{ ansible_password }}"
+            user: "{{ esxi_username }}"
+            password: "{{ esxi_password }}"
             headers:
               Content-Type: "text/xml; charset=utf-8"
               SOAPAction: "urn:vim25/8.0"
@@ -70,18 +70,20 @@
                 <soapenv:Body>
                   <vim:Login>
                     <vim:_this type="SessionManager">ha-sessionmgr</vim:_this>
-                    <vim:userName>{{ ansible_user }}</vim:userName>
-                    <vim:password>{{ ansible_password }}</vim:password>
+                    <vim:userName>{{ esxi_username }}</vim:userName>
+                    <vim:password>{{ esxi_password }}</vim:password>
                   </vim:Login>
                 </soapenv:Body>
               </soapenv:Envelope>
             timeout: 30
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           register: soap_login
           
-        - name: Extract session cookie
+        - name: Store session cookie
           set_fact:
-            vmware_session: "{{ soap_login.cookies['vmware_soap_session'] | default('') }}"
+            vmware_session: "{{ soap_login.cookies['vmware_soap_session'] }}"
           when: soap_login is success
           
         - name: Start SSH service (TSM-SSH)
@@ -99,13 +101,15 @@
                                 xmlns:vim="urn:vim25">
                 <soapenv:Body>
                   <vim:StartService>
-                    <vim:_this type="HostServiceSystem">ha-host-service-system</vim:_this>
+                    <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
                     <vim:id>TSM-SSH</vim:id>
                   </vim:StartService>
                 </soapenv:Body>
               </soapenv:Envelope>
             timeout: 30
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           when: vmware_session is defined
           register: ssh_start
           
@@ -124,7 +128,7 @@
                                 xmlns:vim="urn:vim25">
                 <soapenv:Body>
                   <vim:UpdateServicePolicy>
-                    <vim:_this type="HostServiceSystem">ha-host-service-system</vim:_this>
+                    <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
                     <vim:id>TSM-SSH</vim:id>
                     <vim:policy>on</vim:policy>
                   </vim:UpdateServicePolicy>
@@ -132,9 +136,11 @@
               </soapenv:Envelope>
             timeout: 30
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           when: vmware_session is defined
           
-        - name: Wait for SSH port to become available
+        - name: Wait for SSH to become available
           wait_for:
             host: "{{ target_host }}"
             port: 22
@@ -142,263 +148,254 @@
             delay: 5
             timeout: 60
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           register: ssh_wait
           
         - name: Mark SSH as enabled by automation
           set_fact:
-            ssh_enabled_by_automation: true
-            ssh_enable_timestamp: "{{ ansible_date_time.epoch | default(now().strftime('%s')) }}"
+            ssh_was_enabled_by_automation: true
           when: ssh_wait is success
           
       rescue:
-        - name: SSH enablement failed - continuing with assumption SSH is already enabled
+        - name: SSH enablement failed
           debug:
-            msg: "Failed to enable SSH via API. Assuming SSH is already enabled and continuing..."
-          
-        - name: Set SSH pre-existing flag
-          set_fact:
-            ssh_enabled_by_automation: false
-            ssh_was_preexisting: true
+            msg: "SSH auto-enable failed. Assuming SSH is already enabled."
             
     # =========================================================================
-    # STAGE 2: PRE-CHECK VALIDATION
+    # SECTION 2: PRE-CHECK VALIDATION
     # =========================================================================
-    - name: "STAGE 2: Pre-check Validation"
+    - name: "2.1: Run Pre-check Validations"
+      vars:
+        ansible_connection: ssh
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        ansible_user: "{{ esxi_username }}"
+        ansible_password: "{{ esxi_password }}"
       block:
-        - name: Set pre-check timestamps
-          set_fact:
-            precheck_start_epoch: "{{ now().strftime('%s') }}"
-            precheck_start_iso: "{{ now().isoformat() }}"
-            
-        - name: Send pre-check start event to Dynatrace
-          when: 
-            - enable_dynatrace | bool
-            - dynatrace_token != ''
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/events/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              eventType: "CUSTOM_INFO"
-              title: "ESXi Pre-check Started"
-              properties:
-                host: "{{ inventory_hostname }}"
-                target_ip: "{{ target_host }}"
-                phase: "precheck"
-                timestamp: "{{ precheck_start_iso }}"
-            status_code: [200, 201, 202]
-          delegate_to: localhost
-          ignore_errors: yes
-          
         - name: Test SSH connectivity
           wait_for_connection:
             timeout: 30
-          register: ssh_check
+          register: ssh_connectivity
           
-        - name: Get ESXi version information
+        - name: Get ESXi version
           raw: vmware -v
-          register: version_output
+          register: esxi_version
           
-        - name: Get ESXi detailed version
-          raw: vmware -vl
-          register: version_detailed
-          ignore_errors: yes
-          
-        - name: Extract current build number
+        - name: Get ESXi build number
           raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
-          register: current_build_raw
+          register: current_build
           
-        - name: Check all datastores for available space
+        - name: Check all datastores
           raw: |
-            echo "=== Datastore Space Check ==="
-            # Method 1: Using df
-            for DS in /vmfs/volumes/datastore*; do
-              if [ -d "$DS" ]; then
+            echo "=== Datastore Analysis ==="
+            for DS in /vmfs/volumes/*; do
+              if [ -d "$DS" ] && [[ "$DS" == *"datastore"* || -f "$DS/.vmfs" ]]; then
                 DS_NAME=$(basename "$DS")
-                FREE_RAW=$(df -h "$DS" 2>/dev/null | tail -1 | awk '{print $4}')
-                TOTAL_RAW=$(df -h "$DS" 2>/dev/null | tail -1 | awk '{print $2}')
+                TOTAL=$(df -B G "$DS" 2>/dev/null | tail -1 | awk '{print $2}' | sed 's/G//')
+                FREE=$(df -B G "$DS" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
+                PERCENT=$(df "$DS" 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//')
                 
-                # Convert to GB
-                FREE_GB=0
-                if echo "$FREE_RAW" | grep -q "G"; then
-                  FREE_GB=$(echo "$FREE_RAW" | sed 's/G//')
-                elif echo "$FREE_RAW" | grep -q "T"; then
-                  FREE_GB=$(echo "$FREE_RAW" | sed 's/T//' | awk '{print $1 * 1024}')
-                elif echo "$FREE_RAW" | grep -q "M"; then
-                  FREE_GB=$(echo "$FREE_RAW" | sed 's/M//' | awk '{print $1 / 1024}')
+                if [ ! -z "$FREE" ]; then
+                  echo "DATASTORE:${DS_NAME}:${DS}:${TOTAL}:${FREE}:${PERCENT}"
                 fi
-                
-                echo "Datastore: $DS_NAME"
-                echo "  Path: $DS"
-                echo "  Total: $TOTAL_RAW"
-                echo "  Free: $FREE_RAW (${FREE_GB}GB)"
-                echo "RESULT:$DS:$FREE_GB"
               fi
-            done | grep "RESULT:" | sort -t: -k3 -rn | head -1
-          register: datastore_check
+            done | grep "^DATASTORE:"
+          register: datastore_analysis
           
-        - name: Alternative datastore check using esxcli
-          when: datastore_check.stdout == ""
+        - name: Check VM inventory
           raw: |
-            esxcli storage filesystem list | grep -E "VMFS|NFS" | while read line; do
-              VOL=$(echo "$line" | awk '{print $2}')
-              SIZE=$(echo "$line" | awk '{print $3}')
-              FREE=$(echo "$line" | awk '{print $5}')
-              if [ "$FREE" -gt 0 ] 2>/dev/null; then
-                FREE_GB=$((FREE / 1073741824))
-                echo "${VOL}:${FREE_GB}"
-              fi
-            done | sort -t: -k2 -rn | head -1
-          register: datastore_esxcli
-          
-        - name: Check system health status
-          raw: |
-            echo "=== System Health Check ==="
-            # Check CPU and Memory
-            esxcli hardware cpu global get | grep -E "CPU Packages|CPU Cores"
-            esxcli hardware memory get | grep "Physical Memory"
-            
-            # Check for any hardware alerts
-            esxcli hardware ipmi sdr list 2>/dev/null | grep -i "error\|critical\|warning" | head -5 || echo "No critical hardware alerts"
-          register: health_check
-          ignore_errors: yes
-          
-        - name: Check running VMs count
-          raw: |
-            TOTAL_VMS=$(vim-cmd vmsvc/getallvms 2>/dev/null | tail -n +2 | wc -l)
+            echo "=== VM Inventory ==="
+            TOTAL=0
             POWERED_ON=0
+            VM_LIST=""
+            
             for VMID in $(vim-cmd vmsvc/getallvms 2>/dev/null | tail -n +2 | awk '{print $1}'); do
-              STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
-              if echo "$STATE" | grep -q "Powered on"; then
+              TOTAL=$((TOTAL + 1))
+              VM_NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2)
+              VM_STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+              
+              if echo "$VM_STATE" | grep -q "Powered on"; then
                 POWERED_ON=$((POWERED_ON + 1))
+                VM_LIST="${VM_LIST}${VM_NAME}:on,"
+              else
+                VM_LIST="${VM_LIST}${VM_NAME}:off,"
               fi
             done
-            echo "Total VMs: $TOTAL_VMS"
-            echo "Powered On: $POWERED_ON"
-            echo "VM_COUNT:$TOTAL_VMS:$POWERED_ON"
-          register: vm_count
-          
-        - name: Check maintenance mode status
-          raw: esxcli system maintenanceMode get
-          register: maintenance_mode
-          
-        - name: Parse collected information
-          set_fact:
-            # Basic info
-            host_ssh_status: "{{ 'PASS' if ssh_check.elapsed < 30 else 'FAIL' }}"
-            host_current_build: "{{ current_build_raw.stdout | trim }}"
-            host_version: "{{ version_output.stdout | trim }}"
-            host_version_detailed: "{{ version_detailed.stdout | default('N/A') | trim }}"
             
-            # Datastore info
-            datastore_result: >-
-              {%- if datastore_check.stdout and 'RESULT:' in datastore_check.stdout -%}
-                {{ datastore_check.stdout | regex_search('RESULT:(.*)$', '\\1') | first }}
-              {%- elif datastore_esxcli.stdout | default('') -%}
-                {{ datastore_esxcli.stdout | trim }}
-              {%- else -%}
-                none:0
-              {%- endif -%}
+            echo "VMCOUNT:${TOTAL}:${POWERED_ON}"
+            echo "VMLIST:${VM_LIST}"
+          register: vm_inventory
+          
+        - name: Check system health
+          raw: |
+            echo "=== System Health ==="
+            # CPU info
+            CPU_MODEL=$(esxcli hardware cpu global get 2>/dev/null | grep "CPU Model" | cut -d: -f2 | xargs)
+            CPU_CORES=$(esxcli hardware cpu global get 2>/dev/null | grep "CPU Cores" | cut -d: -f2 | xargs)
             
-            # VM info
-            vm_info: >-
-              {%- if vm_count.stdout and 'VM_COUNT:' in vm_count.stdout -%}
-                {{ vm_count.stdout | regex_search('VM_COUNT:(.*)$', '\\1') | first }}
-              {%- else -%}
-                0:0
-              {%- endif -%}
+            # Memory info
+            MEM_TOTAL=$(esxcli hardware memory get 2>/dev/null | grep "Physical Memory" | cut -d: -f2 | xargs)
             
             # Maintenance mode
-            is_in_maintenance: "{{ 'Enabled' in maintenance_mode.stdout }}"
+            MM_STATUS=$(esxcli system maintenanceMode get 2>/dev/null)
             
-        - name: Set derived facts
-          set_fact:
-            host_selected_datastore: "{{ datastore_result.split(':')[0] if ':' in datastore_result else 'none' }}"
-            host_available_space: "{{ datastore_result.split(':')[1] | float if ':' in datastore_result else 0 }}"
-            total_vms: "{{ vm_info.split(':')[0] | int if ':' in vm_info else 0 }}"
-            powered_on_vms: "{{ vm_info.split(':')[1] | int if ':' in vm_info else 0 }}"
-            needs_patching: "{{ host_current_build | int < target_build | int }}"
+            # Network adapters
+            VMNIC_COUNT=$(esxcli network nic list 2>/dev/null | tail -n +2 | wc -l)
             
-        - name: Determine pre-check status
-          set_fact:
-            precheck_passed: "{{ host_ssh_status == 'PASS' and host_available_space | float >= minimum_space_gb | float }}"
-            precheck_warnings: >-
-              {%- set warnings = [] -%}
-              {%- if host_ssh_status != 'PASS' -%}
-                {%- set _ = warnings.append('SSH connectivity issue') -%}
-              {%- endif -%}
-              {%- if host_available_space | float < minimum_space_gb | float -%}
-                {%- set _ = warnings.append('Insufficient space: ' + host_available_space | string + 'GB available, ' + minimum_space_gb | string + 'GB required') -%}
-              {%- endif -%}
-              {%- if powered_on_vms | int > 0 -%}
-                {%- set _ = warnings.append(powered_on_vms | string + ' VMs are powered on') -%}
-              {%- endif -%}
-              {%- if is_in_maintenance -%}
-                {%- set _ = warnings.append('Host is in maintenance mode') -%}
-              {%- endif -%}
-              {{ warnings | join(', ') if warnings else 'None' }}
-              
-        - name: Send pre-check metrics to Dynatrace
-          when: 
-            - enable_dynatrace | bool
-            - dynatrace_token != ''
-          uri:
-            url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
-            method: POST
-            headers:
-              Authorization: "Api-Token {{ dynatrace_token }}"
-              Content-Type: "text/plain; charset=utf-8"
-            body: |
-              esxi.precheck.ssh_status,host={{ inventory_hostname }} {{ 1 if host_ssh_status == 'PASS' else 0 }} {{ precheck_start_epoch }}
-              esxi.precheck.build_number,host={{ inventory_hostname }} {{ host_current_build }} {{ precheck_start_epoch }}
-              esxi.precheck.datastore_space_gb,host={{ inventory_hostname }} {{ host_available_space }} {{ precheck_start_epoch }}
-              esxi.precheck.vm_count_total,host={{ inventory_hostname }} {{ total_vms }} {{ precheck_start_epoch }}
-              esxi.precheck.vm_count_powered,host={{ inventory_hostname }} {{ powered_on_vms }} {{ precheck_start_epoch }}
-              esxi.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }} {{ precheck_start_epoch }}
-              esxi.precheck.needs_patching,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ precheck_start_epoch }}
-            status_code: [200, 201, 202, 204]
-          delegate_to: localhost
-          ignore_errors: yes
+            echo "CPU:${CPU_MODEL}"
+            echo "CORES:${CPU_CORES}"
+            echo "MEMORY:${MEM_TOTAL}"
+            echo "MAINTENANCE:${MM_STATUS}"
+            echo "NICS:${VMNIC_COUNT}"
+          register: system_health
+          
+        - name: Check for existing patches
+          raw: |
+            if [ -f "/vmfs/volumes/*/patches/{{ patch_file }}" ]; then
+              PATCH_PATH=$(find /vmfs/volumes -name "{{ patch_file }}" 2>/dev/null | head -1)
+              PATCH_SIZE=$(ls -lh "$PATCH_PATH" 2>/dev/null | awk '{print $5}')
+              echo "PATCH_EXISTS:${PATCH_PATH}:${PATCH_SIZE}"
+            else
+              echo "PATCH_EXISTS:none:0"
+            fi
+          register: patch_check
           
     # =========================================================================
-    # STAGE 3: DISABLE SSH IF ENABLED BY AUTOMATION
+    # SECTION 3: PARSE AND ANALYZE RESULTS
     # =========================================================================
-    - name: "STAGE 3: Disable SSH (if enabled by automation)"
-      when: 
-        - manage_ssh_automatically | bool
-        - disable_ssh_after_check | bool
-        - ssh_enabled_by_automation | default(false)
+    - name: "3.1: Parse Pre-check Results"
+      set_fact:
+        current_build_number: "{{ current_build.stdout | trim }}"
+        needs_patching: "{{ (current_build.stdout | trim | int) < (target_build | int) }}"
+        
+        # Parse datastore with most free space
+        best_datastore: >-
+          {%- set datastores = [] -%}
+          {%- for line in datastore_analysis.stdout_lines -%}
+            {%- if line.startswith('DATASTORE:') -%}
+              {%- set parts = line.split(':') -%}
+              {%- set _ = datastores.append({'name': parts[1], 'path': parts[2], 'total': parts[3]|int, 'free': parts[4]|int, 'used_percent': parts[5]|int}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ datastores | sort(attribute='free', reverse=true) | first | default({'name': 'none', 'path': '/tmp', 'free': 0}) }}
+        
+        # Parse VM counts
+        vm_stats: >-
+          {%- set result = {'total': 0, 'powered_on': 0} -%}
+          {%- for line in vm_inventory.stdout_lines -%}
+            {%- if line.startswith('VMCOUNT:') -%}
+              {%- set parts = line.split(':') -%}
+              {%- set _ = result.update({'total': parts[1]|int, 'powered_on': parts[2]|int}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+        
+        # System health
+        is_maintenance_mode: "{{ 'Enabled' in system_health.stdout }}"
+        
+        # Patch existence
+        patch_already_staged: "{{ 'none' not in patch_check.stdout }}"
+        
+    - name: "3.2: Determine Pre-check Status"
+      set_fact:
+        precheck_passed: >-
+          {{ 
+            (ssh_connectivity is success) and
+            (best_datastore.free | int >= minimum_space_gb | int) and
+            (not is_maintenance_mode or vm_stats.powered_on == 0)
+          }}
+        
+        precheck_warnings: >-
+          {%- set warnings = [] -%}
+          {%- if best_datastore.free | int < minimum_space_gb | int -%}
+            {%- set _ = warnings.append('Insufficient space: ' + best_datastore.free|string + 'GB available, ' + minimum_space_gb|string + 'GB required') -%}
+          {%- endif -%}
+          {%- if vm_stats.powered_on > 0 -%}
+            {%- set _ = warnings.append(vm_stats.powered_on|string + ' VMs are powered on') -%}
+          {%- endif -%}
+          {%- if is_maintenance_mode -%}
+            {%- set _ = warnings.append('Host is already in maintenance mode') -%}
+          {%- endif -%}
+          {%- if not needs_patching -%}
+            {%- set _ = warnings.append('Host already at target build ' + target_build) -%}
+          {%- endif -%}
+          {{ warnings | join(', ') if warnings else 'None' }}
+          
+    # =========================================================================
+    # SECTION 4: REPORTING
+    # =========================================================================
+    - name: "4.1: Send Dynatrace Metrics"
+      when: dynatrace_enabled | bool and dynatrace_token is defined
+      uri:
+        url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
+        method: POST
+        headers:
+          Authorization: "Api-Token {{ dynatrace_token }}"
+          Content-Type: "text/plain; charset=utf-8"
+        body: |
+          esxi.precheck.status,host={{ inventory_hostname }} {{ 1 if precheck_passed else 0 }} {{ precheck_timestamp }}
+          esxi.precheck.build,host={{ inventory_hostname }} {{ current_build_number }} {{ precheck_timestamp }}
+          esxi.precheck.space_gb,host={{ inventory_hostname }} {{ best_datastore.free }} {{ precheck_timestamp }}
+          esxi.precheck.vms_total,host={{ inventory_hostname }} {{ vm_stats.total }} {{ precheck_timestamp }}
+          esxi.precheck.vms_powered,host={{ inventory_hostname }} {{ vm_stats.powered_on }} {{ precheck_timestamp }}
+          esxi.precheck.needs_patch,host={{ inventory_hostname }} {{ 1 if needs_patching else 0 }} {{ precheck_timestamp }}
+        status_code: [200, 201, 202, 204]
+      delegate_to: localhost
+      vars:
+        ansible_connection: local
+      ignore_errors: yes
+      
+    - name: "4.2: Display Pre-check Summary"
+      debug:
+        msg:
+          - "============================================================"
+          - "STAGE 1: PRE-CHECK SUMMARY"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }} ({{ target_host }})"
+          - "------------------------------------------------------------"
+          - "SYSTEM INFO:"
+          - "  ESXi Version: {{ esxi_version.stdout | trim }}"
+          - "  Current Build: {{ current_build_number }}"
+          - "  Target Build: {{ target_build }}"
+          - "  Needs Patching: {{ 'YES ⚠️' if needs_patching else 'NO ✓' }}"
+          - "  Maintenance Mode: {{ 'YES' if is_maintenance_mode else 'NO' }}"
+          - "------------------------------------------------------------"
+          - "STORAGE:"
+          - "  Best Datastore: {{ best_datastore.name }}"
+          - "  Path: {{ best_datastore.path }}"
+          - "  Available Space: {{ best_datastore.free }}GB"
+          - "  Required Space: {{ minimum_space_gb }}GB"
+          - "  Space Check: {{ 'PASS ✓' if best_datastore.free|int >= minimum_space_gb|int else 'FAIL ✗' }}"
+          - "  Patch Staged: {{ 'YES' if patch_already_staged else 'NO' }}"
+          - "------------------------------------------------------------"
+          - "VIRTUAL MACHINES:"
+          - "  Total VMs: {{ vm_stats.total }}"
+          - "  Powered On: {{ vm_stats.powered_on }}"
+          - "------------------------------------------------------------"
+          - "PRE-CHECK STATUS: {{ 'PASSED ✓' if precheck_passed else 'FAILED ✗' }}"
+          - "WARNINGS: {{ precheck_warnings }}"
+          - "SSH Auto-Enabled: {{ 'YES' if ssh_was_enabled_by_automation else 'NO' }}"
+          - "============================================================"
+          
+    - name: "4.3: Save Pre-check Results"
+      set_stats:
+        data:
+          stage1_status: "{{ 'passed' if precheck_passed else 'failed' }}"
+          needs_patching: "{{ needs_patching }}"
+          current_build: "{{ current_build_number }}"
+          target_build: "{{ target_build }}"
+          selected_datastore: "{{ best_datastore.path }}"
+          available_space_gb: "{{ best_datastore.free }}"
+          vm_count_total: "{{ vm_stats.total }}"
+          vm_count_powered: "{{ vm_stats.powered_on }}"
+          ssh_enabled: "{{ ssh_was_enabled_by_automation }}"
+          warnings: "{{ precheck_warnings }}"
+          
+    - name: "4.4: Disable SSH if Needed"
+      when:
+        - not keep_ssh_enabled | bool
+        - ssh_was_enabled_by_automation | bool
       block:
-        - name: Re-authenticate for SSH disable
-          uri:
-            url: "https://{{ target_host }}/sdk"
-            method: POST
-            validate_certs: no
-            force_basic_auth: yes
-            user: "{{ ansible_user }}"
-            password: "{{ ansible_password }}"
-            headers:
-              Content-Type: "text/xml; charset=utf-8"
-              SOAPAction: "urn:vim25/8.0"
-            body: |
-              <?xml version="1.0" encoding="UTF-8"?>
-              <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
-                                xmlns:vim="urn:vim25">
-                <soapenv:Body>
-                  <vim:Login>
-                    <vim:_this type="SessionManager">ha-sessionmgr</vim:_this>
-                    <vim:userName>{{ ansible_user }}</vim:userName>
-                    <vim:password>{{ ansible_password }}</vim:password>
-                  </vim:Login>
-                </soapenv:Body>
-              </soapenv:Envelope>
-            timeout: 30
-          delegate_to: localhost
-          register: soap_reauth
-          
         - name: Stop SSH service
           uri:
             url: "https://{{ target_host }}/sdk"
@@ -407,118 +404,28 @@
             headers:
               Content-Type: "text/xml; charset=utf-8"
               SOAPAction: "urn:vim25/8.0"
-              Cookie: "vmware_soap_session={{ soap_reauth.cookies['vmware_soap_session'] }}"
+              Cookie: "vmware_soap_session={{ vmware_session }}"
             body: |
               <?xml version="1.0" encoding="UTF-8"?>
               <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
                                 xmlns:vim="urn:vim25">
                 <soapenv:Body>
                   <vim:StopService>
-                    <vim:_this type="HostServiceSystem">ha-host-service-system</vim:_this>
+                    <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
                     <vim:id>TSM-SSH</vim:id>
                   </vim:StopService>
                 </soapenv:Body>
               </soapenv:Envelope>
             timeout: 30
           delegate_to: localhost
-          when: soap_reauth is success
-          
-        - name: Set SSH service policy to 'off'
-          uri:
-            url: "https://{{ target_host }}/sdk"
-            method: POST
-            validate_certs: no
-            headers:
-              Content-Type: "text/xml; charset=utf-8"
-              SOAPAction: "urn:vim25/8.0"
-              Cookie: "vmware_soap_session={{ soap_reauth.cookies['vmware_soap_session'] }}"
-            body: |
-              <?xml version="1.0" encoding="UTF-8"?>
-              <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
-                                xmlns:vim="urn:vim25">
-                <soapenv:Body>
-                  <vim:UpdateServicePolicy>
-                    <vim:_this type="HostServiceSystem">ha-host-service-system</vim:_this>
-                    <vim:id>TSM-SSH</vim:id>
-                    <vim:policy>off</vim:policy>
-                  </vim:UpdateServicePolicy>
-                </soapenv:Body>
-              </soapenv:Envelope>
-            timeout: 30
-          delegate_to: localhost
-          when: soap_reauth is success
-          
-        - name: Verify SSH is disabled
-          wait_for:
-            host: "{{ target_host }}"
-            port: 22
-            state: stopped
-            timeout: 30
-          delegate_to: localhost
           vars:
             ansible_connection: local
-          ignore_errors: yes
-          register: ssh_disabled_check
-          
-        - name: Set SSH disabled flag
-          set_fact:
-            ssh_was_disabled: "{{ ssh_disabled_check is success }}"
             
-    # =========================================================================
-    # FINAL: DISPLAY RESULTS
-    # =========================================================================
-    - name: Display pre-check results
-      debug:
-        msg:
-          - "========================================="
-          - "ESXi PRE-CHECK RESULTS"
-          - "========================================="
-          - "Host: {{ inventory_hostname }}"
-          - "IP Address: {{ target_host }}"
-          - "========================================="
-          - "SYSTEM INFORMATION:"
-          - "  Current Version: {{ host_version }}"
-          - "  Current Build: {{ host_current_build }}"
-          - "  Target Build: {{ target_build }}"
-          - "  Needs Patching: {{ 'YES ⚠' if needs_patching else 'NO ✓' }}"
-          - "========================================="
-          - "RESOURCE STATUS:"
-          - "  SSH Connectivity: {{ host_ssh_status }}"
-          - "  Selected Datastore: {{ host_selected_datastore }}"
-          - "  Available Space: {{ host_available_space }}GB"
-          - "  Required Space: {{ minimum_space_gb }}GB"
-          - "  Space Check: {{ 'PASS ✓' if host_available_space | float >= minimum_space_gb | float else 'FAIL ✗' }}"
-          - "========================================="
-          - "VM STATUS:"
-          - "  Total VMs: {{ total_vms }}"
-          - "  Powered On: {{ powered_on_vms }}"
-          - "  Maintenance Mode: {{ 'YES' if is_in_maintenance else 'NO' }}"
-          - "========================================="
-          - "PRE-CHECK STATUS: {{ 'PASSED ✓' if precheck_passed else 'FAILED ✗' }}"
-          - "WARNINGS: {{ precheck_warnings }}"
-          - "========================================="
-          - "SSH MANAGEMENT:"
-          - "  SSH Auto-Enabled: {{ 'YES' if ssh_enabled_by_automation | default(false) else 'NO' }}"
-          - "  SSH Auto-Disabled: {{ 'YES' if ssh_was_disabled | default(false) else 'N/A' }}"
-          - "========================================="
-          
-    - name: Set statistics for AWX
-      set_stats:
-        data:
-          precheck_status: "{{ 'passed' if precheck_passed else 'failed' }}"
-          needs_patching: "{{ needs_patching }}"
-          current_build: "{{ host_current_build }}"
-          target_build: "{{ target_build }}"
-          available_space_gb: "{{ host_available_space }}"
-          required_space_gb: "{{ minimum_space_gb }}"
-          total_vms: "{{ total_vms }}"
-          powered_on_vms: "{{ powered_on_vms }}"
-          ssh_auto_managed: "{{ ssh_enabled_by_automation | default(false) }}"
-          warnings: "{{ precheck_warnings }}"
-          
-    - name: Fail if pre-check doesn't pass and enforcement is enabled
+    - name: "4.5: Fail if Pre-check Failed"
       fail:
-        msg: "Pre-check FAILED! {{ precheck_warnings }}"
-      when: 
+        msg: |
+          Pre-check FAILED for {{ inventory_hostname }}
+          Warnings: {{ precheck_warnings }}
+      when:
         - not precheck_passed
-        - enforce_precheck | default(false) | bool
+        - enforce_precheck | default(true) | bool
