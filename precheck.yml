@@ -455,6 +455,8 @@
             state: stopped
             timeout: 30
           delegate_to: localhost
+          vars:
+            ansible_connection: local
           ignore_errors: yes
           register: ssh_disabled_check
           
