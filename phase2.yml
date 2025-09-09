@@ -1,170 +1,586 @@
 ---
-# phase2.yml
-# Purpose: Phase 2 - VM shutdown, maintenance mode, reboot to apply staged patch, verify build, restore VMs.
-# Inputs: target_build (optional) to validate post-reboot build.
+# stage3_apply.yml
+# Stage 3: ESXi Patch Application - VM Management, Reboot, and Verification
+# This stage handles VMs, reboots the host, and verifies patch installation
 
-- name: Phase2 - Start temporary SSH on ESXi hosts (via API)
-  hosts: localhost
-  gather_facts: false
-  collections:
-    - community.vmware
-  vars:
-    ssh_service_name: "TSM-SSH"
-    ssh_enable_timeout: 600
-  tasks:
-    - name: Start SSH service on each ESXi via API
-      vmware_host_service_manager:
-        hostname: "{{ item }}"
-        username: "{{ esxi_api_user }}"
-        password: "{{ esxi_api_pass }}"
-        validate_certs: "{{ validate_certs | default(false) }}"
-        service: "{{ ssh_service_name }}"
-        state: started
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      register: ssh_start
-      retries: 3
-      delay: 5
-      until: ssh_start is succeeded
-
-    - name: Wait for SSH reachable for each ESXi
-      wait_for:
-        host: "{{ item }}"
-        port: 22
-        state: started
-        timeout: "{{ ssh_enable_timeout }}"
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      delegate_to: localhost
-
-- name: Phase2 - Apply patch (reboot) & VM management
-  hosts: esxi_hosts
+- name: "Stage 3: ESXi Patch Application and Reboot"
+  hosts: all
   gather_facts: no
-  serial: 1
+  serial: 1  # Critical: Only one host at a time
+  
   vars:
-    vm_state_file: "/tmp/esxi_vm_state_{{ inventory_hostname }}.txt"
-    vm_shutdown_timeout: "{{ vm_shutdown_timeout | default(300) }}"
+    # Host Configuration
+    target_host: "{{ ansible_host | default(inventory_hostname) }}"
+    ansible_connection: ssh
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    ansible_user: "root"
+    ansible_password: "{{ vault_esxi_password | default('Ajay@426344') }}"
+    
+    # SSH Management
+    enable_ssh_automatically: "{{ auto_ssh | default(true) }}"
+    disable_ssh_after_patching: "{{ disable_ssh_post_patch | default(true) }}"
+    
+    # Patch Configuration
+    target_build: "{{ esxi_target_build | default('24859861') }}"
+    
+    # VM Management
+    vm_shutdown_timeout: "{{ vm_shutdown_wait | default(300) }}"
+    vm_shutdown_method: "{{ vm_shutdown_type | default('soft') }}"  # soft or hard
+    vm_state_file: "/tmp/vm_state_{{ inventory_hostname }}.txt"
+    auto_start_vms: "{{ vm_auto_start | default(true) }}"
+    
+    # Reboot Configuration
+    reboot_delay: 10  # Seconds before reboot
+    initial_wait_after_reboot: "{{ post_reboot_wait | default(180) }}"
+    max_wait_for_host: "{{ max_host_wait | default(900) }}"
+    ssh_check_interval: 30
+    
+    # Dynatrace Monitoring
+    dynatrace_enabled: "{{ enable_dynatrace | default(true) }}"
+    dynatrace_url: "{{ dt_url | default('https://ofp39563.live.dynatrace.com') }}"
+    dynatrace_token: "{{ dt_api_token }}"
+    
   tasks:
-    - name: Save powered-on VM list to state file
-      raw: |
-        > "{{ vm_state_file }}"
-        for VMID in $(vim-cmd vmsvc/getallvms | tail -n +2 | awk '{print $1}'); do
-          STATE=$(vim-cmd vmsvc/power.getstate $VMID | tail -1)
-          if echo "$STATE" | grep -q "Powered on"; then
-            NAME=$(vim-cmd vmsvc/get.summary $VMID | grep -E "name = " | cut -d'"' -f2)
-            echo "$VMID:$NAME" >> "{{ vm_state_file }}"
-          fi
-        done
-        if [ -s "{{ vm_state_file }}" ]; then echo "SAVED"; else echo "EMPTY"; fi
-      register: save_vm_state
-      changed_when: false
-
-    - name: Gracefully shutdown powered-on VMs
-      raw: |
-        if [ -f "{{ vm_state_file }}" ] && [ -s "{{ vm_state_file }}" ]; then
-          while read LINE; do
-            VMID=$(echo "$LINE" | cut -d: -f1)
-            echo "Shutting VM $VMID"
-            vim-cmd vmsvc/power.shutdown $VMID 2>/dev/null || vim-cmd vmsvc/power.off $VMID
-          done < "{{ vm_state_file }}"
-        fi
-      register: shutdown_out
-      when: save_vm_state.stdout is search('SAVED')
-
-    - name: Wait for VMs to be powered off (timeout)
-      raw: |
-        TIMEOUT={{ vm_shutdown_timeout }}
-        ELAPSED=0
-        while [ $ELAPSED -lt $TIMEOUT ]; do
-          RUNNING=0
-          for VMID in $(cat "{{ vm_state_file }}" 2>/dev/null | cut -d: -f1); do
-            STATE=$(vim-cmd vmsvc/power.getstate $VMID | tail -1)
-            if echo "$STATE" | grep -q "Powered on"; then RUNNING=$((RUNNING+1)); fi
-          done
-          if [ $RUNNING -eq 0 ]; then echo "ALL_DOWN"; exit 0; fi
-          sleep 5
-          ELAPSED=$((ELAPSED+5))
-        done
-        echo "TIMEOUT"
-      register: wait_vm_off
-      when: save_vm_state.stdout is search('SAVED')
-
-    - name: Enter maintenance mode
-      raw: |
-        mm=$(esxcli system maintenanceMode get || true)
-        if echo "$mm" | grep -iq "Disabled"; then
-          esxcli system maintenanceMode set --enable true && echo "ENABLED"
-        else
-          echo "ALREADY_ENABLED"
-        fi
-      register: mm_enter
-
-    - name: Reboot host to apply staged patch
-      raw: |
-        esxcli system shutdown reboot --delay=10 --reason="Patching via Ansible"
-      async: 0
-      poll: 0
-      ignore_errors: yes
-
-    - name: Wait for host to go offline (SSH closed)
-      wait_for:
-        host: "{{ inventory_hostname }}"
-        port: 22
-        state: stopped
-        timeout: 300
-      delegate_to: localhost
-      ignore_errors: yes
-
-    - name: Pause briefly
-      pause:
-        seconds: 30
-
-    - name: Wait for SSH to come back up
-      wait_for:
-        host: "{{ inventory_hostname }}"
-        port: 22
-        state: started
-        timeout: 1200
-      delegate_to: localhost
-
-    - name: Wait for connection ready
-      wait_for_connection:
-        timeout: 600
-        delay: 10
-
-    - name: Get post-reboot build
-      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2 || true
-      register: post_build
-      retries: 3
-      delay: 10
-      until: post_build.rc == 0
-
-    - name: Determine if patch applied (best-effort)
+    # =========================================================================
+    # SECTION 1: ENABLE SSH AND INITIALIZE
+    # =========================================================================
+    - name: "1.1: Initialize Apply Stage"
       set_fact:
-        patch_applied: "{{ (post_build.stdout | trim) == (target_build | default('')) }}"
-      # if target_build not provided, you may adapt comparison to patch_profile->build parsing
-
-    - name: Exit maintenance mode
-      raw: |
-        mm=$(esxcli system maintenanceMode get || true)
-        if echo "$mm" | grep -iq "Enabled"; then
-          esxcli system maintenanceMode set --enable false && echo "DISABLED"
-        else
-          echo "ALREADY_DISABLED"
-        fi
-      register: mm_exit
-
-    - name: Power on previously running VMs (restore)
-      raw: |
-        if [ -f "{{ vm_state_file }}" ] && [ -s "{{ vm_state_file }}" ]; then
-          while read LINE; do
-            VMID=$(echo "$LINE" | cut -d: -f1)
-            echo "Starting VM $VMID"
-            vim-cmd vmsvc/power.on "$VMID" 2>/dev/null || echo "FAIL:$VMID"
-          done < "{{ vm_state_file }}"
-        fi
-      register: vm_restore_out
-      ignore_errors: yes
-
-    - name: Send phase2 metrics to Dynatrace
+        apply_timestamp: "{{ now().strftime('%s') }}"
+        apply_date: "{{ now().isoformat() }}"
+        vmware_session: ""
+        ssh_was_enabled_by_stage3: false
+        
+    - name: "1.2: Enable SSH if Needed"
+      when: enable_ssh_automatically | bool
+      block:
+        - name: Check SSH availability
+          wait_for:
+            host: "{{ target_host }}"
+            port: 22
+            state: started
+            timeout: 5
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          register: ssh_check
+          ignore_errors: yes
+          
+        - name: Enable SSH via SOAP API
+          when: ssh_check is failed
+          block:
+            - name: Login to SOAP API
+              uri:
+                url: "https://{{ target_host }}/sdk"
+                method: POST
+                validate_certs: no
+                force_basic_auth: yes
+                user: "{{ ansible_user }}"
+                password: "{{ ansible_password }}"
+                headers:
+                  Content-Type: "text/xml; charset=utf-8"
+                body: |
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                    xmlns:vim="urn:vim25">
+                    <soapenv:Body>
+                      <vim:Login>
+                        <vim:_this type="SessionManager">ha-sessionmgr</vim:_this>
+                        <vim:userName>{{ ansible_user }}</vim:userName>
+                        <vim:password>{{ ansible_password }}</vim:password>
+                      </vim:Login>
+                    </soapenv:Body>
+                  </soapenv:Envelope>
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+              register: soap_login
+              
+            - name: Store session
+              set_fact:
+                vmware_session: "{{ soap_login.cookies['vmware_soap_session'] }}"
+                
+            - name: Start SSH service
+              uri:
+                url: "https://{{ target_host }}/sdk"
+                method: POST
+                validate_certs: no
+                headers:
+                  Content-Type: "text/xml; charset=utf-8"
+                  Cookie: "vmware_soap_session={{ vmware_session }}"
+                body: |
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                    xmlns:vim="urn:vim25">
+                    <soapenv:Body>
+                      <vim:StartService>
+                        <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
+                        <vim:id>TSM-SSH</vim:id>
+                      </vim:StartService>
+                    </soapenv:Body>
+                  </soapenv:Envelope>
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+                
+            - name: Mark SSH enabled
+              set_fact:
+                ssh_was_enabled_by_stage3: true
+                
+    # =========================================================================
+    # SECTION 2: PRE-REBOOT CHECKS
+    # =========================================================================
+    - name: "2.1: Verify Current Build"
+      raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+      register: pre_reboot_build
+      
+    - name: "2.2: Check if Already at Target Build"
+      set_fact:
+        already_patched: "{{ (pre_reboot_build.stdout | trim | int) >= (target_build | int) }}"
+        
+    - name: "2.3: Skip if Already Patched"
+      when: already_patched
+      block:
+        - name: Display already patched message
+          debug:
+            msg:
+              - "Host {{ inventory_hostname }} is already at or above target build"
+              - "Current: {{ pre_reboot_build.stdout | trim }}, Target: {{ target_build }}"
+              
+        - name: End play
+          meta: end_play
+          
+    # =========================================================================
+    # SECTION 3: VM MANAGEMENT - SHUTDOWN
+    # =========================================================================
+    - name: "3.1: VM Inventory and Shutdown"
+      block:
+        - name: Get powered-on VMs
+          raw: |
+            echo "=== VM Inventory ==="
+            POWERED_VMS=""
+            VM_NAMES=""
+            
+            for VMID in $(vim-cmd vmsvc/getallvms 2>/dev/null | tail -n +2 | awk '{print $1}'); do
+              STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+              
+              if echo "$STATE" | grep -q "Powered on"; then
+                NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2)
+                AUTOSTART=$(vim-cmd vmsvc/get.config $VMID 2>/dev/null | grep -E "autostart = " | cut -d'=' -f2 | xargs)
+                
+                echo "Found powered VM: $NAME (ID: $VMID, Autostart: $AUTOSTART)"
+                POWERED_VMS="${POWERED_VMS} ${VMID}"
+                VM_NAMES="${VM_NAMES}${VMID}:${NAME}:${AUTOSTART};"
+              fi
+            done
+            
+            echo "POWERED_LIST:${POWERED_VMS}"
+            echo "VM_DETAILS:${VM_NAMES}"
+          register: vm_inventory
+          
+        - name: Parse VM list
+          set_fact:
+            powered_vm_ids: >-
+              {%- set vms = [] -%}
+              {%- for line in vm_inventory.stdout_lines -%}
+                {%- if line.startswith('POWERED_LIST:') -%}
+                  {%- set ids = line.replace('POWERED_LIST:', '').strip().split() -%}
+                  {%- for id in ids if id -%}
+                    {%- set _ = vms.append(id) -%}
+                  {%- endfor -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ vms }}
+              
+            vm_details: >-
+              {%- set details = {} -%}
+              {%- for line in vm_inventory.stdout_lines -%}
+                {%- if line.startswith('VM_DETAILS:') -%}
+                  {%- set items = line.replace('VM_DETAILS:', '').strip().split(';') -%}
+                  {%- for item in items if ':' in item -%}
+                    {%- set parts = item.split(':') -%}
+                    {%- if parts|length >= 3 -%}
+                      {%- set _ = details.update({parts[0]: {'name': parts[1], 'autostart': parts[2]}}) -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ details }}
+              
+        - name: Save VM state to file
+          when: powered_vm_ids | length > 0
+          raw: |
+            STATE_FILE="{{ vm_state_file }}"
+            > "$STATE_FILE"
+            
+            {% for vm_id in powered_vm_ids %}
+            echo "{{ vm_id }}:{{ vm_details[vm_id]['name'] | default('VM-' + vm_id) }}:{{ vm_details[vm_id]['autostart'] | default('false') }}" >> "$STATE_FILE"
+            {% endfor %}
+            
+            echo "Saved {{ powered_vm_ids | length }} VM states to $STATE_FILE"
+            cat "$STATE_FILE"
+          register: vm_state_saved
+          
+        - name: Shutdown VMs
+          when: powered_vm_ids | length > 0
+          raw: |
+            echo "=== Shutting Down VMs ==="
+            VM_IDS="{{ powered_vm_ids | join(' ') }}"
+            SHUTDOWN_METHOD="{{ vm_shutdown_method }}"
+            
+            for VMID in $VM_IDS; do
+              NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2)
+              echo "Shutting down: $NAME (ID: $VMID)"
+              
+              if [ "$SHUTDOWN_METHOD" = "soft" ]; then
+                # Try graceful shutdown first
+                vim-cmd vmsvc/power.shutdown $VMID 2>/dev/null
+                RESULT=$?
+                
+                if [ $RESULT -ne 0 ]; then
+                  echo "  Graceful shutdown failed, forcing power off"
+                  vim-cmd vmsvc/power.off $VMID 2>/dev/null
+                fi
+              else
+                # Hard power off
+                vim-cmd vmsvc/power.off $VMID 2>/dev/null
+              fi
+            done
+            
+            # Wait for VMs to power off
+            echo "Waiting for VMs to shut down (timeout: {{ vm_shutdown_timeout }}s)..."
+            TIMEOUT={{ vm_shutdown_timeout }}
+            ELAPSED=0
+            
+            while [ $ELAPSED -lt $TIMEOUT ]; do
+              STILL_ON=0
+              for VMID in $VM_IDS; do
+                STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+                if echo "$STATE" | grep -q "Powered on"; then
+                  STILL_ON=$((STILL_ON + 1))
+                fi
+              done
+              
+              if [ $STILL_ON -eq 0 ]; then
+                echo "All VMs successfully shut down"
+                break
+              fi
+              
+              echo "  $STILL_ON VMs still running..."
+              sleep 10
+              ELAPSED=$((ELAPSED + 10))
+            done
+            
+            if [ $STILL_ON -gt 0 ]; then
+              echo "WARNING: $STILL_ON VMs did not shut down within timeout"
+              # Force power off remaining VMs
+              for VMID in $VM_IDS; do
+                STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+                if echo "$STATE" | grep -q "Powered on"; then
+                  echo "  Force stopping VM ID: $VMID"
+                  vim-cmd vmsvc/power.off $VMID 2>/dev/null
+                fi
+              done
+            fi
+          register: vm_shutdown_result
+          
+    # =========================================================================
+    # SECTION 4: ENTER MAINTENANCE MODE
+    # =========================================================================
+    - name: "4.1: Enter Maintenance Mode"
+      block:
+        - name: Check current maintenance mode
+          raw: esxcli system maintenanceMode get
+          register: mm_status
+          
+        - name: Enter maintenance mode if needed
+          when: "'Disabled' in mm_status.stdout"
+          raw: |
+            echo "Entering maintenance mode..."
+            esxcli system maintenanceMode set --enable true
+            
+            # Verify
+            sleep 2
+            MM_CHECK=$(esxcli system maintenanceMode get)
+            if echo "$MM_CHECK" | grep -q "Enabled"; then
+              echo "MAINTENANCE_MODE_ENABLED"
+            else
+              echo "MAINTENANCE_MODE_FAILED"
+            fi
+          register: mm_enable
+          
+    # =========================================================================
+    # SECTION 5: REBOOT HOST
+    # =========================================================================
+    - name: "5.1: Initiate Host Reboot"
+      block:
+        - name: Record reboot start time
+          set_fact:
+            reboot_start_time: "{{ now().strftime('%s') }}"
+            
+        - name: Send Dynatrace reboot event
+          when: dynatrace_enabled | bool and dynatrace_token is defined
+          uri:
+            url: "{{ dynatrace_url }}/api/v2/events/ingest"
+            method: POST
+            headers:
+              Authorization: "Api-Token {{ dynatrace_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              eventType: "CUSTOM_INFO"
+              title: "ESXi Host Rebooting for Patch"
+              properties:
+                host: "{{ inventory_hostname }}"
+                action: "reboot_initiated"
+                pre_build: "{{ pre_reboot_build.stdout | trim }}"
+                target_build: "{{ target_build }}"
+            status_code: [200, 201, 202]
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          
+        - name: Issue reboot command
+          raw: |
+            echo "Initiating system reboot in {{ reboot_delay }} seconds..."
+            esxcli system shutdown reboot --delay={{ reboot_delay }} --reason="ESXi_Patching"
+            echo "REBOOT_SCHEDULED"
+          ignore_errors: yes
+          failed_when: false
+          
+        - name: Wait for host to go offline
+          wait_for:
+            host: "{{ target_host }}"
+            port: 22
+            state: stopped
+            timeout: 120
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          ignore_errors: yes
+          
+    # =========================================================================
+    # SECTION 6: WAIT FOR HOST TO COME BACK
+    # =========================================================================
+    - name: "6.1: Wait for Host Recovery"
+      block:
+        - name: Initial wait period
+          pause:
+            seconds: "{{ initial_wait_after_reboot }}"
+            prompt: "Waiting {{ initial_wait_after_reboot }} seconds for host to complete reboot..."
+            
+        - name: Wait for SSH to return
+          wait_for:
+            host: "{{ target_host }}"
+            port: 22
+            state: started
+            delay: 30
+            timeout: "{{ max_wait_for_host }}"
+            sleep: "{{ ssh_check_interval }}"
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          register: ssh_recovery
+          
+        - name: Wait for SSH connection to stabilize
+          wait_for_connection:
+            timeout: 300
+            delay: 10
+            sleep: 5
+          register: connection_recovery
+          
+    # =========================================================================
+    # SECTION 7: POST-REBOOT VERIFICATION
+    # =========================================================================
+    - name: "7.1: Verify Patch Installation"
+      block:
+        - name: Calculate downtime
+          set_fact:
+            downtime_seconds: "{{ (now().strftime('%s') | int) - (reboot_start_time | int) }}"
+            
+        - name: Get post-reboot build
+          raw: vmware -v | grep -o 'build-[0-9]*' | cut -d'-' -f2
+          register: post_reboot_build
+          retries: 3
+          delay: 10
+          until: post_reboot_build.rc == 0
+          
+        - name: Verify patch applied
+          set_fact:
+            patch_applied: "{{ (post_reboot_build.stdout | trim | int) == (target_build | int) }}"
+            build_change: "{{ pre_reboot_build.stdout | trim }} → {{ post_reboot_build.stdout | trim }}"
+            
+        - name: Get detailed version info
+          raw: vmware -vl
+          register: detailed_version
+          
+    # =========================================================================
+    # SECTION 8: EXIT MAINTENANCE MODE
+    # =========================================================================
+    - name: "8.1: Exit Maintenance Mode"
+      block:
+        - name: Check maintenance mode status
+          raw: esxcli system maintenanceMode get
+          register: mm_post_status
+          
+        - name: Exit maintenance mode if needed
+          when: "'Enabled' in mm_post_status.stdout"
+          raw: |
+            echo "Exiting maintenance mode..."
+            esxcli system maintenanceMode set --enable false
+            
+            # Verify
+            sleep 2
+            MM_CHECK=$(esxcli system maintenanceMode get)
+            if echo "$MM_CHECK" | grep -q "Disabled"; then
+              echo "MAINTENANCE_MODE_DISABLED"
+            else
+              echo "MAINTENANCE_MODE_EXIT_FAILED"
+            fi
+          register: mm_disable
+          
+    # =========================================================================
+    # SECTION 9: RESTORE VMS
+    # =========================================================================
+    - name: "9.1: Power On VMs"
+      when: 
+        - auto_start_vms | bool
+        - powered_vm_ids | default([]) | length > 0
+      block:
+        - name: Read VM state file
+          raw: |
+            STATE_FILE="{{ vm_state_file }}"
+            if [ -f "$STATE_FILE" ]; then
+              cat "$STATE_FILE"
+            else
+              echo "NO_STATE_FILE"
+            fi
+          register: vm_state_content
+          
+        - name: Power on VMs from saved state
+          when: "'NO_STATE_FILE' not in vm_state_content.stdout"
+          raw: |
+            echo "=== Restoring VMs ==="
+            STATE_FILE="{{ vm_state_file }}"
+            
+            SUCCESS=0
+            FAILED=0
+            
+            while IFS=: read -r VMID NAME AUTOSTART; do
+              echo "Starting VM: $NAME (ID: $VMID)"
+              
+              if vim-cmd vmsvc/power.on "$VMID" 2>/dev/null; then
+                SUCCESS=$((SUCCESS + 1))
+                echo "  ✓ Started successfully"
+              else
+                FAILED=$((FAILED + 1))
+                echo "  ✗ Failed to start"
+              fi
+              
+              # Small delay between VM starts
+              sleep 2
+            done < "$STATE_FILE"
+            
+            echo "RESTORE_SUMMARY: Started $SUCCESS VMs, Failed $FAILED"
+            
+            # Archive state file
+            if [ -f "$STATE_FILE" ]; then
+              ARCHIVE="${STATE_FILE}.$(date +%Y%m%d_%H%M%S)"
+              mv "$STATE_FILE" "$ARCHIVE"
+              echo "State file archived to: $ARCHIVE"
+            fi
+          register: vm_restore_result
+          
+        - name: Verify VM restoration
+          raw: |
+            echo "=== VM Status After Restore ==="
+            sleep 30  # Give VMs time to fully start
+            
+            RUNNING=0
+            STOPPED=0
+            
+            for VMID in {{ powered_vm_ids | join(' ') }}; do
+              STATE=$(vim-cmd vmsvc/power.getstate $VMID 2>/dev/null | tail -1)
+              NAME=$(vim-cmd vmsvc/get.summary $VMID 2>/dev/null | grep -E "name = " | cut -d'"' -f2)
+              
+              if echo "$STATE" | grep -q "Powered on"; then
+                echo "  ✓ $NAME is running"
+                RUNNING=$((RUNNING + 1))
+              else
+                echo "  ✗ $NAME is not running"
+                STOPPED=$((STOPPED + 1))
+              fi
+            done
+            
+            echo "FINAL_STATUS: $RUNNING running, $STOPPED stopped"
+          register: vm_final_status
+          
+    # =========================================================================
+    # SECTION 10: CLEANUP AND REPORTING
+    # =========================================================================
+    - name: "10.1: Disable SSH if Needed"
+      when:
+        - disable_ssh_after_patching | bool
+        - ssh_was_enabled_by_stage3 | bool
+      block:
+        - name: Re-authenticate for SSH disable
+          uri:
+            url: "https://{{ target_host }}/sdk"
+            method: POST
+            validate_certs: no
+            force_basic_auth: yes
+            user: "{{ ansible_user }}"
+            password: "{{ ansible_password }}"
+            headers:
+              Content-Type: "text/xml; charset=utf-8"
+            body: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                xmlns:vim="urn:vim25">
+                <soapenv:Body>
+                  <vim:Login>
+                    <vim:_this type="SessionManager">ha-sessionmgr</vim:_this>
+                    <vim:userName>{{ ansible_user }}</vim:userName>
+                    <vim:password>{{ ansible_password }}</vim:password>
+                  </vim:Login>
+                </soapenv:Body>
+              </soapenv:Envelope>
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          register: soap_reauth
+          
+        - name: Stop SSH service
+          uri:
+            url: "https://{{ target_host }}/sdk"
+            method: POST
+            validate_certs: no
+            headers:
+              Content-Type: "text/xml; charset=utf-8"
+              Cookie: "vmware_soap_session={{ soap_reauth.cookies['vmware_soap_session'] }}"
+            body: |
+              <?xml version="1.0" encoding="UTF-8"?>
+              <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" 
+                                xmlns:vim="urn:vim25">
+                <soapenv:Body>
+                  <vim:StopService>
+                    <vim:_this type="HostServiceSystem">hostServiceSystem</vim:_this>
+                    <vim:id>TSM-SSH</vim:id>
+                  </vim:StopService>
+                </soapenv:Body>
+              </soapenv:Envelope>
+          delegate_to: localhost
+          vars:
+            ansible_connection: local
+          when: soap_reauth is success
+          
+    - name: "10.2: Calculate Total Duration"
+      set_fact:
+        total_duration: "{{ (now().strftime('%s') | int) - (apply_timestamp | int) }}"
+        
+    - name: "10.3: Send Final Dynatrace Metrics"
+      when: dynatrace_enabled | bool and dynatrace_token is defined
       uri:
         url: "{{ dynatrace_url }}/api/v2/metrics/ingest"
         method: POST
@@ -172,49 +588,5 @@
           Authorization: "Api-Token {{ dynatrace_token }}"
           Content-Type: "text/plain; charset=utf-8"
         body: |
-          esxi.patch.phase2.patch_applied,host={{ inventory_hostname }},job_id={{ job_id }} {{ 1 if patch_applied else 0 }} {{ now().strftime('%s') }}
-          esxi.patch.phase2.vm_restore_success,host={{ inventory_hostname }},job_id={{ job_id }} {{ (vm_restore_out.stdout | default('') | regex_search('FAIL') | length == 0) | int }} {{ now().strftime('%s') }}
-        status_code: [200,201,202,204]
-      delegate_to: localhost
-      when: dynatrace_url is defined and dynatrace_token is defined
-
-    - name: Send phase2 event to Dynatrace
-      uri:
-        url: "{{ dynatrace_url }}/api/v2/events/ingest"
-        method: POST
-        headers:
-          Authorization: "Api-Token {{ dynatrace_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          eventType: "CUSTOM_ANNOTATION"
-          title: "ESXi Phase2 Completed - {{ inventory_hostname }} ({{ 'Success' if patch_applied else 'Failed' }})"
-          properties:
-            host: "{{ inventory_hostname }}"
-            stage: "phase2"
-            job_id: "{{ job_id }}"
-            post_build: "{{ post_build.stdout | default('') }}"
-            patch_applied: "{{ patch_applied }}"
-        status_code: [200,201,202]
-      delegate_to: localhost
-      when: dynatrace_url is defined and dynatrace_token is defined
-
-- name: Phase2 - Ensure SSH stopped on ESXi hosts (cleanup)
-  hosts: localhost
-  gather_facts: false
-  collections:
-    - community.vmware
-  tasks:
-    - name: Stop SSH on each ESXi via API (cleanup)
-      vmware_host_service_manager:
-        hostname: "{{ item }}"
-        username: "{{ esxi_api_user }}"
-        password: "{{ esxi_api_pass }}"
-        validate_certs: "{{ validate_certs | default(false) }}"
-        service: "{{ ssh_service_name }}"
-        state: stopped
-      loop: "{{ groups['esxi_hosts'] | default([]) }}"
-      register: ssh_stop
-      retries: 3
-      delay: 5
-      until: ssh_stop is succeeded
+          esxi.patching.status,host={{ inventory_hostname }} {{ 1 if patch_applied else 0 }} {{ apply_timestamp }}
+          esxi.patching.downtime,host={{
